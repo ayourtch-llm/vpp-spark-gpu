@@ -1,0 +1,19 @@
+apt-get update
+apt-get install -y sudo vim make git </dev/null
+UNATTENDED=yes make install-dep install-ext-deps </dev/null
+curl -fsSL https://claude.ai/install.sh | bash
+
+# ── CUDA toolkit for NVIDIA Blackwell GB10 (DGX Spark, aarch64/SBSA) ──
+# Adds NVIDIA's network repo and installs nvcc + headers for CUDA 12.8.
+# The driver (CUDA 13.0) is already present in the container image.
+wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
+dpkg -i cuda-keyring_1.1-1_all.deb
+rm -f cuda-keyring_1.1-1_all.deb
+apt-get update
+apt-get install -y cuda-toolkit-12-8
+
+# Make nvcc available in PATH for the current session and future shells.
+export PATH=/usr/local/cuda-12.8/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH
+echo 'export PATH=/usr/local/cuda-12.8/bin:$PATH' >> /etc/environment
+echo 'export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH' >> /etc/environment

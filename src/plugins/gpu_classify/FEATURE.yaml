@@ -1,0 +1,29 @@
+---
+name: GPU Packet Classifier
+maintainer: VPP GPU Classify Contributors
+features:
+  - Per-packet GPU classification on the ip4-unicast feature arc:
+      - match rules on IPv4 src/dst prefix, L4 protocol, src/dst port, TCP flags
+      - actions: pass (default), drop (error-drop), mark (set vlib_buffer flag)
+  - Rule management via CLI:
+      - add up to 64 rules with first-match-wins semantics
+      - push rules atomically to GPU constant memory
+  - Graceful degradation on non-GPU hardware:
+      - plugin loads and VPP runs normally when no CUDA-capable GPU is present
+      - node passes all packets through unchanged when CUDA is unavailable
+
+description: |-
+        The gpu_classify plugin offloads IPv4 packet classification to an
+        NVIDIA CUDA GPU.  On each VPP frame (up to 256 packets) the CPU
+        extracts header fields into a managed-memory descriptor buffer, the
+        GPU kernel classifies every packet in parallel against a rule table
+        stored in constant memory, and the CPU then routes or drops packets
+        according to the per-packet results.
+
+        Optimised for the NVIDIA GB10 Blackwell SoC (DGX Spark) where CPU
+        and GPU share coherent physical DRAM via NVLink-C2C, eliminating
+        PCIe DMA overhead.  Falls back gracefully to a pure pass-through mode
+        on systems without a CUDA-capable GPU or driver.
+
+state: experimental
+properties: [CLI, STATS, MULTITHREAD]
