@@ -91,14 +91,43 @@ typedef struct
 /**
  * @brief CUDA resources owned by the plugin.
  *
- * The stream handle is kept as void* so this struct can be included
- * in VPP C files without pulling in <cuda_runtime.h>.
+ * Stream and event handles are kept as void* so this struct can be
+ * included in VPP C files without pulling in <cuda_runtime.h>.
  */
 typedef struct
 {
-  void	           *stream;  /**< cudaStream_t (opaque to host C code)      */
-  gpu_pkt_desc_t   *descs;   /**< cudaMallocManaged: [MAX_FRAME] descriptors */
-  uint8_t          *results; /**< cudaMallocManaged: [MAX_FRAME] result bytes */
+  void	           *stream;    /**< cudaStream_t (opaque to host C code)     */
+  void             *ev_start;  /**< cudaEvent_t — kernel start timestamp     */
+  void             *ev_stop;   /**< cudaEvent_t — kernel stop  timestamp     */
+  gpu_pkt_desc_t   *descs;     /**< cudaMallocManaged: [MAX_FRAME] descs     */
+  uint8_t          *results;   /**< cudaMallocManaged: [MAX_FRAME] results   */
+
+  /* Rolling statistics updated by gpu_classify_launch_kernel(). */
+  uint64_t n_kernel_calls;     /**< Total kernel invocations                 */
+  uint64_t n_gpu_packets;      /**< Total packets submitted to the GPU       */
+  float    total_kernel_ms;    /**< Cumulative GPU kernel time (ms)          */
+  float    min_kernel_ms;      /**< Shortest single-frame kernel time (ms)   */
+  float    max_kernel_ms;      /**< Longest  single-frame kernel time (ms)   */
 } gpu_classify_cuda_res_t;
+
+/* ------------------------------------------------------------------ */
+/* GPU device information (filled by gpu_classify_get_device_info())  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * @brief Static properties of the CUDA device queried at show time.
+ *        Uses only stdint.h types so it can live in this shared header.
+ */
+typedef struct
+{
+  char     name[256];          /**< Human-readable device name               */
+  int      compute_major;      /**< SM compute-capability major version      */
+  int      compute_minor;      /**< SM compute-capability minor version      */
+  uint64_t total_mem_bytes;    /**< Total device global memory in bytes      */
+  int      sm_count;           /**< Number of streaming multiprocessors      */
+  int      clock_rate_khz;     /**< GPU core clock rate (kHz)                */
+  int      mem_clock_rate_khz; /**< Memory clock rate (kHz)                  */
+  int      mem_bus_width_bits; /**< Global memory bus width in bits          */
+} gpu_classify_device_info_t;
 
 #endif /* __included_gpu_classify_types_h__ */

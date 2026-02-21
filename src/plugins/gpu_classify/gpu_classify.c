@@ -297,7 +297,8 @@ static clib_error_t *
 gpu_classify_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
 			      vlib_cli_command_t *cmd)
 {
-  gpu_classify_main_t *gcm = &gpu_classify_main;
+  gpu_classify_main_t      *gcm = &gpu_classify_main;
+  gpu_classify_cuda_res_t  *res = &gcm->cuda_res;
 
   static const char *action_names[] = { "pass", "drop", "mark" };
 
@@ -312,6 +313,55 @@ gpu_classify_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
 		   (unsigned long long) gcm->n_pass,
 		   (unsigned long long) gcm->n_drop,
 		   (unsigned long long) gcm->n_mark);
+
+  /* ---- GPU device properties ---- */
+  if (gcm->cuda_ready)
+    {
+      gpu_classify_device_info_t info;
+      if (gpu_classify_get_device_info (&info) == 0)
+	{
+	  /* Express total memory in GiB (rounded to one decimal). */
+	  double mem_gib = (double) info.total_mem_bytes / (1024.0 * 1024.0 * 1024.0);
+	  vlib_cli_output (vm,
+			   "\nGPU Device:\n"
+			   "  Name    : %s\n"
+			   "  Compute : sm_%d.%d\n"
+			   "  Memory  : %.1f GiB\n"
+			   "  SMs     : %d\n"
+			   "  Clocks  : core %.2f GHz  |  %d-bit memory @ %.2f GHz",
+			   info.name,
+			   info.compute_major, info.compute_minor,
+			   mem_gib,
+			   info.sm_count,
+			   info.clock_rate_khz     / 1e6,
+			   info.mem_bus_width_bits,
+			   info.mem_clock_rate_khz / 1e6);
+	}
+    }
+
+  /* ---- Kernel statistics ---- */
+  vlib_cli_output (vm, "\nKernel Statistics:");
+  if (res->n_kernel_calls == 0)
+    {
+      vlib_cli_output (vm, "  No frames processed yet.");
+    }
+  else
+    {
+      double avg_pkt = (double) res->n_gpu_packets / res->n_kernel_calls;
+      float  avg_ms  = res->total_kernel_ms / res->n_kernel_calls;
+      /* Convert ms → us for display (kernel is typically sub-millisecond). */
+      vlib_cli_output (vm,
+		       "  Frames  : %llu\n"
+		       "  Packets : %llu  (avg %.1f / frame)\n"
+		       "  Latency : avg %.1f us  min %.1f us  max %.1f us"
+		       "  (GPU kernel only)",
+		       (unsigned long long) res->n_kernel_calls,
+		       (unsigned long long) res->n_gpu_packets,
+		       avg_pkt,
+		       (double) avg_ms          * 1000.0,
+		       (double) res->min_kernel_ms * 1000.0,
+		       (double) res->max_kernel_ms * 1000.0);
+    }
 
   /* Print per-interface enable state */
   vlib_cli_output (vm, "\nEnabled interfaces:");

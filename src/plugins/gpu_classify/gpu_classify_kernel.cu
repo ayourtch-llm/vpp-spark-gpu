@@ -21,8 +21,10 @@
  */
 
 #include <cuda_runtime.h>
+#include <float.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
 
 /* Pull in only the shared type definitions — no VPP headers needed on
  * the device-code compilation path.                                   */
@@ -171,6 +173,33 @@ extern "C"
     cudaMemAdvise (res->results, GPU_CLASSIFY_MAX_FRAME * sizeof (uint8_t),
 		   cudaMemAdviseSetPreferredLocation, 0 /* device 0 */);
 
+    /* Create CUDA events used for per-frame kernel timing. */
+    cudaEvent_t ev_start, ev_stop;
+    err = cudaEventCreate (&ev_start);
+    if (err != cudaSuccess)
+      {
+	fprintf (stderr, "gpu_classify: cudaEventCreate (start): %s\n",
+		 cudaGetErrorString (err));
+	goto fail_descs;
+      }
+    err = cudaEventCreate (&ev_stop);
+    if (err != cudaSuccess)
+      {
+	fprintf (stderr, "gpu_classify: cudaEventCreate (stop): %s\n",
+		 cudaGetErrorString (err));
+	cudaEventDestroy (ev_start);
+	goto fail_descs;
+      }
+    res->ev_start = reinterpret_cast<void *> (ev_start);
+    res->ev_stop  = reinterpret_cast<void *> (ev_stop);
+
+    /* Initialise statistics. */
+    res->n_kernel_calls  = 0;
+    res->n_gpu_packets   = 0;
+    res->total_kernel_ms = 0.0f;
+    res->min_kernel_ms   = FLT_MAX;
+    res->max_kernel_ms   = 0.0f;
+
     /* Seed constant memory with zero rules. */
     {
       int zero = 0;
@@ -193,6 +222,16 @@ extern "C"
   void
   gpu_classify_cuda_cleanup (gpu_classify_cuda_res_t *res)
   {
+    if (res->ev_stop)
+      {
+	cudaEventDestroy (reinterpret_cast<cudaEvent_t> (res->ev_stop));
+	res->ev_stop = nullptr;
+      }
+    if (res->ev_start)
+      {
+	cudaEventDestroy (reinterpret_cast<cudaEvent_t> (res->ev_start));
+	res->ev_start = nullptr;
+      }
     if (res->results)
       {
 	cudaFree (res->results);
@@ -243,22 +282,65 @@ extern "C"
     if (n_packets == 0)
       return 0;
 
-    cudaStream_t stream = reinterpret_cast<cudaStream_t> (res->stream);
+    cudaStream_t stream   = reinterpret_cast<cudaStream_t> (res->stream);
+    cudaEvent_t  ev_start = reinterpret_cast<cudaEvent_t> (res->ev_start);
+    cudaEvent_t  ev_stop  = reinterpret_cast<cudaEvent_t> (res->ev_stop);
 
     /* One block of 256 threads — one thread per packet slot.
      * Threads in slots [n_packets, 255] write PASS to their result.  */
     dim3 block (GPU_CLASSIFY_MAX_FRAME);
     dim3 grid (1);
 
+    cudaEventRecord (ev_start, stream);
     gpu_classify_kernel<<<grid, block, 0, stream>>> (res->descs, res->results,
 						     static_cast<int> (
 						       n_packets));
+    cudaEventRecord (ev_stop, stream);
 
     /* Wait for all GPU writes to be visible to the CPU.
      * On NVLink-C2C the synchronise cost is very low (~microseconds)
      * compared to the PCIe round-trip on discrete GPU systems.       */
     cudaError_t err = cudaStreamSynchronize (stream);
-    return (err == cudaSuccess) ? 0 : -1;
+    if (err != cudaSuccess)
+      return -1;
+
+    /* Accumulate per-frame timing statistics. */
+    float elapsed_ms = 0.0f;
+    cudaEventElapsedTime (&elapsed_ms, ev_start, ev_stop);
+
+    res->n_kernel_calls++;
+    res->n_gpu_packets += n_packets;
+    res->total_kernel_ms += elapsed_ms;
+    if (elapsed_ms < res->min_kernel_ms)
+      res->min_kernel_ms = elapsed_ms;
+    if (elapsed_ms > res->max_kernel_ms)
+      res->max_kernel_ms = elapsed_ms;
+
+    return 0;
+  }
+
+  /* ---------------------------------------------------------------- */
+  int
+  gpu_classify_get_device_info (gpu_classify_device_info_t *info)
+  {
+    int device = 0;
+    if (cudaGetDevice (&device) != cudaSuccess)
+      return -1;
+
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties (&prop, device) != cudaSuccess)
+      return -1;
+
+    strncpy (info->name, prop.name, sizeof (info->name) - 1);
+    info->name[sizeof (info->name) - 1] = '\0';
+    info->compute_major      = prop.major;
+    info->compute_minor      = prop.minor;
+    info->total_mem_bytes    = (uint64_t) prop.totalGlobalMem;
+    info->sm_count           = prop.multiProcessorCount;
+    info->clock_rate_khz     = prop.clockRate;
+    info->mem_clock_rate_khz = prop.memoryClockRate;
+    info->mem_bus_width_bits = prop.memoryBusWidth;
+    return 0;
   }
 
 } /* extern "C" */

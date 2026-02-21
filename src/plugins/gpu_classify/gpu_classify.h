@@ -122,6 +122,12 @@ extern "C"
   int gpu_classify_launch_kernel (gpu_classify_cuda_res_t *res,
 				  u32 n_packets);
 
+  /**
+   * @brief Query static properties of the active CUDA device.
+   * @return 0 on success, -1 if no CUDA device is available.
+   */
+  int gpu_classify_get_device_info (gpu_classify_device_info_t *info);
+
 #ifdef __cplusplus
 }
 #endif
