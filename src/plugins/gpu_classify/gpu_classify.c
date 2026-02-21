@@ -71,6 +71,49 @@ VLIB_INIT_FUNCTION (gpu_classify_init);
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Compute an approximate percentile from the log2-us latency histogram.
+ *
+ * Uses linear interpolation within the matched bucket.
+ * For the overflow bucket (>= 1024 us) returns the lower bound (1024 us).
+ *
+ * @param hist   GPU_CLASSIFY_LAT_BUCKETS-element histogram array.
+ * @param total  Sum of all bucket counts (== n_kernel_calls).
+ * @param pct    Target percentile in [0.0, 1.0].
+ * @return       Approximate latency in microseconds.
+ */
+static double
+lat_hist_percentile (u64 *hist, u64 total, double pct)
+{
+  /* Lower / upper bounds of each bucket in microseconds. */
+  static const double lo[GPU_CLASSIFY_LAT_BUCKETS] = {
+    0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024
+  };
+  static const double hi[GPU_CLASSIFY_LAT_BUCKETS] = {
+    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048
+  };
+
+  if (total == 0)
+    return 0.0;
+
+  u64 target = (u64) (pct * (double) total);
+  u64 cum    = 0;
+
+  for (int b = 0; b < GPU_CLASSIFY_LAT_BUCKETS; b++)
+    {
+      if (cum + hist[b] > target)
+	{
+	  /* Overflow bucket: just report the lower bound. */
+	  if (b == GPU_CLASSIFY_LAT_BUCKETS - 1)
+	    return lo[b];
+	  double frac = (double) (target - cum) / hist[b];
+	  return lo[b] + frac * (hi[b] - lo[b]);
+	}
+      cum += hist[b];
+    }
+  return lo[GPU_CLASSIFY_LAT_BUCKETS - 1]; /* unreachable */
+}
+
 /** Convert a prefix length (0-32) to a network-byte-order mask. */
 static u32
 prefixlen_to_mask (u32 prefixlen)
@@ -348,19 +391,28 @@ gpu_classify_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
   else
     {
       double avg_pkt = (double) res->n_gpu_packets / res->n_kernel_calls;
-      float  avg_ms  = res->total_kernel_ms / res->n_kernel_calls;
-      /* Convert ms → us for display (kernel is typically sub-millisecond). */
+      double avg_us  = (double) res->total_kernel_ms / res->n_kernel_calls
+		       * 1000.0;
+      double p50   = lat_hist_percentile (res->lat_hist, res->n_kernel_calls,
+					  0.500);
+      double p99   = lat_hist_percentile (res->lat_hist, res->n_kernel_calls,
+					  0.990);
+      double p999  = lat_hist_percentile (res->lat_hist, res->n_kernel_calls,
+					  0.999);
+      /* All times in microseconds; kernel is typically sub-millisecond. */
       vlib_cli_output (vm,
 		       "  Frames  : %llu\n"
 		       "  Packets : %llu  (avg %.1f / frame)\n"
 		       "  Latency : avg %.1f us  min %.1f us  max %.1f us"
-		       "  (GPU kernel only)",
+		       "  (GPU kernel only)\n"
+		       "  Pctiles : p50 %.1f us  p99 %.1f us  p99.9 %.1f us",
 		       (unsigned long long) res->n_kernel_calls,
 		       (unsigned long long) res->n_gpu_packets,
 		       avg_pkt,
-		       (double) avg_ms          * 1000.0,
+		       avg_us,
 		       (double) res->min_kernel_ms * 1000.0,
-		       (double) res->max_kernel_ms * 1000.0);
+		       (double) res->max_kernel_ms * 1000.0,
+		       p50, p99, p999);
     }
 
   /* Print per-interface enable state */

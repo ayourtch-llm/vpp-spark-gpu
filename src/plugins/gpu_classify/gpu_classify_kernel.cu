@@ -122,6 +122,36 @@ gpu_classify_kernel (const gpu_pkt_desc_t *__restrict__ descs,
 /* C-callable host wrappers                                           */
 /* ================================================================== */
 
+/* ================================================================== */
+/* Host-side helpers                                                   */
+/* ================================================================== */
+
+/**
+ * Map a kernel duration in microseconds to a log2-us histogram bucket.
+ *
+ *   bucket  0 : [    0,    1) us
+ *   bucket  k : [ 2^(k-1), 2^k ) us   for k = 1 … GPU_CLASSIFY_LAT_BUCKETS-2
+ *   bucket 11 : [ 1024,  ∞ ) us   (overflow)
+ */
+static int
+lat_us_to_bucket (float us)
+{
+  if (us < 1.0f)
+    return 0;
+  int   b     = 1;
+  float bound = 2.0f;
+  while (bound <= us && b < GPU_CLASSIFY_LAT_BUCKETS - 1)
+    {
+      bound *= 2.0f;
+      b++;
+    }
+  return b;
+}
+
+/* ================================================================== */
+/* C-callable host wrappers                                           */
+/* ================================================================== */
+
 extern "C"
 {
 
@@ -315,6 +345,8 @@ extern "C"
       res->min_kernel_ms = elapsed_ms;
     if (elapsed_ms > res->max_kernel_ms)
       res->max_kernel_ms = elapsed_ms;
+
+    res->lat_hist[lat_us_to_bucket (elapsed_ms * 1000.0f)]++;
 
     return 0;
   }

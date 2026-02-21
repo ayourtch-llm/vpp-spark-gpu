@@ -24,6 +24,19 @@
 /** Maximum packets per VPP frame (== VLIB_FRAME_SIZE).               */
 #define GPU_CLASSIFY_MAX_FRAME  256
 
+/**
+ * Number of buckets in the kernel-latency histogram.
+ *
+ * Log2-microsecond scale:
+ *   bucket  0 : [    0,    1) us
+ *   bucket  1 : [    1,    2) us
+ *   bucket  2 : [    2,    4) us
+ *   ...
+ *   bucket k  : [ 2^(k-1), 2^k ) us   for k = 1 … 10
+ *   bucket 11 : [ 1024,  ∞ ) us   (overflow)
+ */
+#define GPU_CLASSIFY_LAT_BUCKETS 12
+
 /* Packet actions written to the result buffer by the GPU kernel. */
 #define GPU_CLASSIFY_ACTION_PASS  0   /**< forward to next feature     */
 #define GPU_CLASSIFY_ACTION_DROP  1   /**< send to error-drop          */
@@ -108,6 +121,9 @@ typedef struct
   float    total_kernel_ms;    /**< Cumulative GPU kernel time (ms)          */
   float    min_kernel_ms;      /**< Shortest single-frame kernel time (ms)   */
   float    max_kernel_ms;      /**< Longest  single-frame kernel time (ms)   */
+
+  /** Log2-us latency histogram — see GPU_CLASSIFY_LAT_BUCKETS above. */
+  uint64_t lat_hist[GPU_CLASSIFY_LAT_BUCKETS];
 } gpu_classify_cuda_res_t;
 
 /* ------------------------------------------------------------------ */
