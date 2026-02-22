@@ -111,29 +111,94 @@ typedef struct
 } gpu_classify_rule_t;
 
 /* ------------------------------------------------------------------ */
+/* Persistent-kernel control block — 256 bytes, two cache lines      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * @brief CPU↔GPU handshake for the persistent classification kernel.
+ *
+ * Placed in cudaMallocManaged memory so both CPU (Grace ARM) and GPU
+ * (Blackwell GB10) can access it natively over NVLink-C2C.
+ *
+ * Layout: two 128-byte cache lines — one owned by the CPU, one by the
+ * GPU — to prevent false-sharing between cores and the GPU L2.
+ *
+ * Protocol (CPU side):
+ *   1. Write n_packets.
+ *   2. Atomic-store submit_seq += 1 with __ATOMIC_SEQ_CST.
+ *   3. Spin-poll done_seq with __ATOMIC_ACQUIRE until done_seq == submit_seq.
+ *
+ * Protocol (GPU persistent kernel, thread 0):
+ *   1. Spin-poll submit_seq (volatile) until it differs from last seen value.
+ *   2. Broadcast seq / n_packets / kill via shared memory + __syncthreads().
+ *   3. All threads classify; __threadfence_system() + __syncthreads().
+ *   4. Thread 0 writes done_seq = seq.
+ *
+ * Kill sequence (CPU):
+ *   1. Atomic-store kill = 1 with __ATOMIC_SEQ_CST.
+ *   2. Atomic-store submit_seq += 1 with __ATOMIC_SEQ_CST (wakes GPU).
+ *   3. cudaStreamSynchronize() waits for the kernel to return.
+ */
+typedef struct
+{
+  /* ---- Cache line 0: CPU writes, GPU reads (128 bytes) ----------- *
+   * submit_seq / done_seq: accessed via cuda::atomic_ref on the GPU  *
+   * and __atomic_store/load_n on the CPU.  They MUST be plain (non-  *
+   * volatile) uint32_t so cuda::atomic_ref can bind without a cast.  */
+  uint32_t submit_seq;           /**< Incremented per batch by the CPU      */
+  volatile int32_t  n_packets;   /**< Packet count for this batch           */
+  volatile uint32_t kill;        /**< Set to 1 to terminate the kernel      */
+  uint8_t _cpu_pad[128 - 12];    /**< Pad to exactly 128 bytes              */
+
+  /* ---- Cache line 1: GPU writes, CPU reads (128 bytes) ----------- */
+  uint32_t done_seq;             /**< Incremented when batch is complete    */
+  uint8_t _gpu_pad[128 - 4];     /**< Pad to exactly 128 bytes              */
+  /*                                 ─────────────────────────── 256 B total */
+} gpu_classify_ctrl_t;
+
+/* ------------------------------------------------------------------ */
+/* Adaptive persistent-kernel thresholds                              */
+/* ------------------------------------------------------------------ */
+
+/** Consecutive "busy" frames (≥ MIN_PKTS packets) before activating
+ *  the persistent kernel.                                            */
+#define GPU_CLASSIFY_PERSIST_START_FRAMES  4
+
+/** Consecutive "idle" frames (< MIN_PKTS packets) before deactivating
+ *  the persistent kernel and reverting to on-demand launch.         */
+#define GPU_CLASSIFY_PERSIST_STOP_FRAMES  16
+
+/** Minimum packets per frame to be counted as "busy".               */
+#define GPU_CLASSIFY_PERSIST_MIN_PKTS    128
+
+/* ------------------------------------------------------------------ */
 /* CUDA resource bundle                                               */
 /* ------------------------------------------------------------------ */
 
 /**
  * @brief CUDA resources owned by the plugin.
  *
- * Stream and event handles are kept as void* so this struct can be
- * included in VPP C files without pulling in <cuda_runtime.h>.
+ * The stream handle is kept as void* so this struct can be included in
+ * VPP C files without pulling in <cuda_runtime.h>.
  */
 typedef struct
 {
-  void	           *stream;    /**< cudaStream_t (opaque to host C code)     */
-  void             *ev_start;  /**< cudaEvent_t — kernel start timestamp     */
-  void             *ev_stop;   /**< cudaEvent_t — kernel stop  timestamp     */
-  gpu_pkt_desc_t   *descs;     /**< cudaMallocManaged: [MAX_FRAME] descs     */
-  uint8_t          *results;   /**< cudaMallocManaged: [MAX_FRAME] results   */
+  void	                *stream;       /**< cudaStream_t (opaque to C code)  */
+  gpu_pkt_desc_t        *descs;        /**< cudaMallocManaged: [MAX_FRAME]   */
+  uint8_t               *results;      /**< cudaMallocManaged: [MAX_FRAME]   */
+  gpu_classify_ctrl_t   *ctrl;         /**< cudaMallocManaged: handshake     */
+
+  /* Adaptive dispatch state (updated by gpu_classify_launch_kernel). */
+  int      persist_active;  /**< 1 when the persistent kernel is running    */
+  uint32_t busy_frames;     /**< Consecutive frames with ≥ MIN_PKTS packets */
+  uint32_t idle_frames;     /**< Consecutive frames with < MIN_PKTS packets */
 
   /* Rolling statistics updated by gpu_classify_launch_kernel(). */
-  uint64_t n_kernel_calls;     /**< Total kernel invocations                 */
-  uint64_t n_gpu_packets;      /**< Total packets submitted to the GPU       */
-  float    total_kernel_ms;    /**< Cumulative GPU kernel time (ms)          */
-  float    min_kernel_ms;      /**< Shortest single-frame kernel time (ms)   */
-  float    max_kernel_ms;      /**< Longest  single-frame kernel time (ms)   */
+  uint64_t n_kernel_calls;  /**< Total kernel invocations                   */
+  uint64_t n_gpu_packets;   /**< Total packets submitted to the GPU         */
+  float    total_kernel_ms; /**< Cumulative round-trip time (ms)            */
+  float    min_kernel_ms;   /**< Shortest single-frame round-trip (ms)      */
+  float    max_kernel_ms;   /**< Longest  single-frame round-trip (ms)      */
 
   /** Log2-us latency histogram — see GPU_CLASSIFY_LAT_BUCKETS above. */
   uint64_t lat_hist[GPU_CLASSIFY_LAT_BUCKETS];

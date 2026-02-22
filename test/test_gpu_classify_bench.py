@@ -3,9 +3,11 @@
 """
 gpu_classify benchmark — GPU kernel vs CPU ACL plugin.
 
-Measures packets/second (as seen by the VPP test framework) for
-gpu_classify and the built-in ACL plugin under identical rule workloads
-on the ip4-unicast feature arc.
+Measures true packet-processing throughput (Mpps) and latency per
+256-packet vlib frame (μs/frame) by injecting packets via VPP's built-in
+packet generator in sustained generator mode.  No Python round-trips occur
+between frames during the timed phase — VPP's pg runs N_REPS × BATCH
+packets continuously and we measure wall-clock elapsed time.
 
 Three scenarios, each run at rule counts {1, 8, 32, 64}:
 
@@ -13,10 +15,7 @@ Three scenarios, each run at rule counts {1, 8, 32, 64}:
   first-match N rules;      traffic matches rule 0     → exits after 1 compare
   last-match  N rules;      traffic matches rule N-1   → full linear scan + match
 
-In every scenario all packets exit on pg1 so ``send_and_expect`` can be
-used for timing without artificial timeouts.
-
-GPU  action for "matching" rules  → MARK  (packet forwarded, still exits pg1)
+GPU  action for "matching" rules  → MARK  (packet forwarded)
 ACL  action for "matching" rules  → PERMIT (packet forwarded)
 
 Run with::
@@ -25,6 +24,7 @@ Run with::
 
 """
 
+import os
 import time
 import unittest
 
@@ -34,6 +34,7 @@ from asfframework import VppTestRunner
 
 from scapy.layers.l2 import Ether
 from scapy.layers.inet import IP, TCP
+from scapy.utils import wrpcap
 
 from vpp_acl import AclRule, VppAcl, VppAclInterface
 
@@ -52,8 +53,12 @@ class TestGpuClassifyBench(VppTestCase):
     # Tuning knobs
     # ------------------------------------------------------------------
 
-    BATCH = 256         # packets per send — one full vlib frame
-    REPS  = 50          # timed repetitions per measurement point
+    BATCH  = 256       # packets per vlib frame (one pg stream replay)
+    N_REPS = 50000     # timed replays of the 256-packet template
+    #   → total packets per measurement = BATCH × N_REPS = 12.8 M
+    #   → at 10 Mpps ≈ 1.28 s; at 50 Mpps ≈ 256 ms; at 100 Mpps ≈ 128 ms
+
+    POLL_S = 0.05      # seconds between "show packet-generator" polls
 
     # Rule counts to sweep (gpu_classify maximum is 64)
     RULE_COUNTS = [1, 8, 32, 64]
@@ -144,7 +149,17 @@ class TestGpuClassifyBench(VppTestCase):
         self._acl_if = None
 
     def tearDown(self):
-        # Best-effort cleanup; errors here must not mask test failures.
+        # Best-effort cleanup of any leftover pg streams.
+        try:
+            self.vapi.cli("packet-generator disable")
+        except Exception:
+            pass
+        try:
+            self.vapi.cli("packet-generator delete bench-stream")
+        except Exception:
+            pass
+
+        # GPU cleanup.
         try:
             if self._gpu_enabled:
                 self.vapi.cli("gpu-classify rule clear")
@@ -156,6 +171,8 @@ class TestGpuClassifyBench(VppTestCase):
                 )
         except Exception:
             pass
+
+        # ACL cleanup.
         try:
             if self._acl_if is not None:
                 self._acl_if.remove_vpp_config()
@@ -163,6 +180,7 @@ class TestGpuClassifyBench(VppTestCase):
                 self._acl.remove_vpp_config()
         except Exception:
             pass
+
         super().tearDown()
 
     # ------------------------------------------------------------------
@@ -179,26 +197,75 @@ class TestGpuClassifyBench(VppTestCase):
         ]
 
     # ------------------------------------------------------------------
-    # Timing core
+    # pg generator timing core
     # ------------------------------------------------------------------
 
-    def _time_send(self, pkts):
+    def _pg_wait(self, stream_name, timeout=120):
+        """Poll show packet-generator until the named stream is no longer
+        running (Enabled column no longer shows 'Yes').
         """
-        Send *pkts* through VPP REPS times and return throughput in Mpps.
+        deadline = time.time() + timeout
+        while True:
+            status = self.vapi.cli("show packet-generator")
+            still_running = any(
+                stream_name in line and "Yes" in line
+                for line in status.splitlines()
+            )
+            if not still_running:
+                return
+            if time.time() > deadline:
+                raise TimeoutError(
+                    f"pg stream '{stream_name}' did not finish within {timeout}s"
+                )
+            time.sleep(self.POLL_S)
 
-        One warm-up pass (not counted) is performed first to prime any
-        lazy-initialisation paths in both VPP and the Python framework.
-        All packets must arrive at pg1; no drops allowed.
+    def _time_pg(self, pkts):
         """
-        # Warm-up
-        self.send_and_expect(self.pg0, pkts, self.pg1)
+        Inject BATCH × N_REPS packets through the active VPP data path using
+        the packet generator in sustained generator mode.
 
+        A warm-up pass (one 256-packet frame) primes the data path before the
+        timed run starts.  During the timed window VPP's pg node injects all
+        N_REPS × BATCH packets without any Python involvement — no round-trips,
+        no synchronisation calls.  Wall-clock elapsed time is measured from
+        immediately before 'packet-generator enable' to immediately after
+        _pg_wait() returns, giving at most ±POLL_S timing error (~50 ms).
+
+        pg output (packets forwarded to pg1) is deliberately NOT captured;
+        the pg output node simply frees forwarded buffers, so there is no
+        buffer accumulation or I/O overhead on the output side.
+
+        Returns (mpps, us_per_frame):
+          mpps         — millions of packets per second (wall-clock)
+          us_per_frame — microseconds to process one 256-packet vlib frame
+        """
+        n_total  = len(pkts) * self.N_REPS
+        pcap_in  = os.path.join(self.tempdir, "bench_in.pcap")
+        wrpcap(pcap_in, pkts)
+
+        stream_def = (
+            f"packet-generator new pcap {pcap_in} "
+            f"source pg0 name bench-stream"
+        )
+
+        # ---- Warm-up: one 256-packet frame ----
+        self.vapi.cli(f"{stream_def} limit {len(pkts)}")
+        self.vapi.cli("packet-generator enable")
+        self._pg_wait("bench-stream")
+        self.vapi.cli("packet-generator delete bench-stream")
+
+        # ---- Timed run ----
+        self.vapi.cli(f"{stream_def} limit {n_total}")
         t0 = time.perf_counter()
-        for _ in range(self.REPS):
-            self.send_and_expect(self.pg0, pkts, self.pg1)
+        self.vapi.cli("packet-generator enable")
+        self._pg_wait("bench-stream")
         elapsed = time.perf_counter() - t0
 
-        return (len(pkts) * self.REPS) / elapsed / 1e6   # Mpps
+        self.vapi.cli("packet-generator delete bench-stream")
+
+        mpps         = n_total / elapsed / 1e6
+        us_per_frame = elapsed / self.N_REPS * 1e6
+        return mpps, us_per_frame
 
     # ------------------------------------------------------------------
     # GPU helpers
@@ -269,23 +336,40 @@ class TestGpuClassifyBench(VppTestCase):
 
     @staticmethod
     def _print_header(title):
-        w = 72
+        w = 80
         sep = "=" * w
         print(f"\n{sep}")
         print(f"  {title}")
         print(sep)
-        print(f"  {'Rules':>6}  {'GPU (Mpps)':>12}  {'ACL (Mpps)':>12}  {'GPU/ACL':>9}")
-        print(f"  {'-'*6}  {'-'*12}  {'-'*12}  {'-'*9}")
+        print(
+            f"  {'Rules':>6}  "
+            f"{'GPU Mpps':>10}  {'GPU μs/fr':>10}  "
+            f"{'ACL Mpps':>10}  {'ACL μs/fr':>10}  "
+            f"{'GPU/ACL':>8}"
+        )
+        print(
+            f"  {'-'*6}  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*8}"
+        )
 
     @staticmethod
-    def _print_row(n_rules, gpu_mpps, acl_mpps):
-        g = f"{gpu_mpps:.3f}" if gpu_mpps is not None else "n/a"
-        a = f"{acl_mpps:.3f}" if acl_mpps is not None else "n/a"
+    def _print_row(n_rules, gpu_mpps, gpu_us, acl_mpps, acl_us):
+        def fmt_mpps(v):
+            return f"{v:10.3f}" if v is not None else f"{'n/a':>10}"
+
+        def fmt_us(v):
+            return f"{v:10.1f}" if v is not None else f"{'n/a':>10}"
+
         if gpu_mpps is not None and acl_mpps is not None:
-            ratio = f"{gpu_mpps / acl_mpps:.2f}x"
+            ratio = f"{gpu_mpps / acl_mpps:7.2f}x"
         else:
-            ratio = "n/a"
-        print(f"  {n_rules:>6}  {g:>12}  {a:>12}  {ratio:>9}")
+            ratio = f"{'n/a':>8}"
+
+        print(
+            f"  {n_rules:>6}  "
+            f"{fmt_mpps(gpu_mpps)}  {fmt_us(gpu_us)}  "
+            f"{fmt_mpps(acl_mpps)}  {fmt_us(acl_us)}  "
+            f"{ratio:>8}"
+        )
 
     # ==================================================================
     # Benchmark 1 — no-match (worst-case linear scan for all rules)
@@ -298,21 +382,22 @@ class TestGpuClassifyBench(VppTestCase):
         # ACL: scans all N deny rules, no match, hits the trailing permit-all.
         pkts = self._pkts(self.PASS_PORT)
 
+        n_total_k = self.BATCH * self.N_REPS // 1000
         self._print_header(
             f"Scenario 1 — no-match  "
-            f"(traffic hits no deny rule; all {self.BATCH}-pkt frames, "
-            f"{self.REPS} reps)"
+            f"(traffic hits no deny rule; {self.BATCH}-pkt frames, "
+            f"{self.N_REPS} reps = {n_total_k}k pkts per measurement)"
         )
 
         for n in self.RULE_COUNTS:
-            gpu_mpps = acl_mpps = None
+            gpu_mpps = gpu_us = acl_mpps = acl_us = None
 
             # ---- GPU ----
             if self.gpu_available:
                 self._gpu_enable()
                 for i in range(n):
                     self._gpu_rule(self.DENY_PORT_BASE + i, "drop")
-                gpu_mpps = self._time_send(pkts)
+                gpu_mpps, gpu_us = self._time_pg(pkts)
                 self._gpu_disable()
 
             # ---- ACL ----
@@ -322,10 +407,10 @@ class TestGpuClassifyBench(VppTestCase):
                     + [AclRule(is_permit=1)]   # permit-all fallthrough
                 )
                 self._acl_install(rules)
-                acl_mpps = self._time_send(pkts)
+                acl_mpps, acl_us = self._time_pg(pkts)
                 self._acl_remove()
 
-            self._print_row(n, gpu_mpps, acl_mpps)
+            self._print_row(n, gpu_mpps, gpu_us, acl_mpps, acl_us)
 
     # ==================================================================
     # Benchmark 2 — first-rule match (best case for linear scan)
@@ -340,14 +425,15 @@ class TestGpuClassifyBench(VppTestCase):
         match_port = self.MATCH_PORT_BASE
         pkts = self._pkts(match_port)
 
+        n_total_k = self.BATCH * self.N_REPS // 1000
         self._print_header(
             f"Scenario 2 — first-match  "
-            f"(rule 0 always fires; all {self.BATCH}-pkt frames, "
-            f"{self.REPS} reps)"
+            f"(rule 0 always fires; {self.BATCH}-pkt frames, "
+            f"{self.N_REPS} reps = {n_total_k}k pkts per measurement)"
         )
 
         for n in self.RULE_COUNTS:
-            gpu_mpps = acl_mpps = None
+            gpu_mpps = gpu_us = acl_mpps = acl_us = None
 
             # ---- GPU ----
             if self.gpu_available:
@@ -355,7 +441,7 @@ class TestGpuClassifyBench(VppTestCase):
                 self._gpu_rule(match_port, "mark")   # rule 0: MARK → forwarded
                 for i in range(1, n):
                     self._gpu_rule(self.DENY_PORT_BASE + i, "drop")
-                gpu_mpps = self._time_send(pkts)
+                gpu_mpps, gpu_us = self._time_pg(pkts)
                 self._gpu_disable()
 
             # ---- ACL ----
@@ -366,10 +452,10 @@ class TestGpuClassifyBench(VppTestCase):
                     + [AclRule(is_permit=1)]               # permit-all fallthrough
                 )
                 self._acl_install(rules)
-                acl_mpps = self._time_send(pkts)
+                acl_mpps, acl_us = self._time_pg(pkts)
                 self._acl_remove()
 
-            self._print_row(n, gpu_mpps, acl_mpps)
+            self._print_row(n, gpu_mpps, gpu_us, acl_mpps, acl_us)
 
     # ==================================================================
     # Benchmark 3 — last-rule match (full scan before finding a match)
@@ -384,14 +470,15 @@ class TestGpuClassifyBench(VppTestCase):
         # worst case for match throughput (same rule-visit count as no-match
         # but with a successful match at the end).
 
+        n_total_k = self.BATCH * self.N_REPS // 1000
         self._print_header(
             f"Scenario 3 — last-match  "
-            f"(rule N-1 fires after full scan; all {self.BATCH}-pkt frames, "
-            f"{self.REPS} reps)"
+            f"(rule N-1 fires after full scan; {self.BATCH}-pkt frames, "
+            f"{self.N_REPS} reps = {n_total_k}k pkts per measurement)"
         )
 
         for n in self.RULE_COUNTS:
-            gpu_mpps = acl_mpps = None
+            gpu_mpps = gpu_us = acl_mpps = acl_us = None
             match_port = self.MATCH_PORT_BASE + n - 1
             pkts = self._pkts(match_port)
 
@@ -401,7 +488,7 @@ class TestGpuClassifyBench(VppTestCase):
                 for i in range(n - 1):
                     self._gpu_rule(self.DENY_PORT_BASE + i, "drop")
                 self._gpu_rule(match_port, "mark")   # rule N-1: MARK → forwarded
-                gpu_mpps = self._time_send(pkts)
+                gpu_mpps, gpu_us = self._time_pg(pkts)
                 self._gpu_disable()
 
             # ---- ACL ----
@@ -412,10 +499,10 @@ class TestGpuClassifyBench(VppTestCase):
                     + [AclRule(is_permit=1)]                 # permit-all fallthrough
                 )
                 self._acl_install(rules)
-                acl_mpps = self._time_send(pkts)
+                acl_mpps, acl_us = self._time_pg(pkts)
                 self._acl_remove()
 
-            self._print_row(n, gpu_mpps, acl_mpps)
+            self._print_row(n, gpu_mpps, gpu_us, acl_mpps, acl_us)
 
 
 if __name__ == "__main__":

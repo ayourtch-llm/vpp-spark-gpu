@@ -177,7 +177,7 @@ mask_to_plen (const u8 *mask, int nbytes)
 static int
 sync_rules_to_gpu (gpu_classify_main_t *gcm)
 {
-  return gpu_classify_update_rules (gcm->rules, gcm->n_rules);
+  return gpu_classify_update_rules (&gcm->cuda_res, gcm->rules, gcm->n_rules);
 }
 
 /* ------------------------------------------------------------------ */
@@ -512,13 +512,16 @@ gpu_classify_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
 					  0.990);
       double p999  = lat_hist_percentile (res->lat_hist, res->n_kernel_calls,
 					  0.999);
-      /* All times in microseconds; kernel is typically sub-millisecond. */
+      /* All times in microseconds; measured as CPU-observed round-trip. */
       vlib_cli_output (vm,
+		       "  Dispatch: %s (busy_frames=%u  idle_frames=%u)\n"
 		       "  Frames  : %llu\n"
 		       "  Packets : %llu  (avg %.1f / frame)\n"
 		       "  Latency : avg %.1f us  min %.1f us  max %.1f us"
-		       "  (GPU kernel only)\n"
+		       "  (GPU round-trip)\n"
 		       "  Pctiles : p50 %.1f us  p99 %.1f us  p99.9 %.1f us",
+		       res->persist_active ? "persistent" : "on-demand",
+		       res->busy_frames, res->idle_frames,
 		       (unsigned long long) res->n_kernel_calls,
 		       (unsigned long long) res->n_gpu_packets,
 		       avg_pkt,

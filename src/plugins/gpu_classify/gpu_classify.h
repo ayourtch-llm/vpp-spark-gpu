@@ -108,7 +108,8 @@ extern "C"
    * @brief Copy @a n_rules rules into GPU constant memory.
    * @return 0 on success, -1 on error (e.g. n_rules > MAX_RULES).
    */
-  int gpu_classify_update_rules (gpu_classify_rule_t *rules, u32 n_rules);
+  int gpu_classify_update_rules (gpu_classify_cuda_res_t *res,
+				 gpu_classify_rule_t *rules, u32 n_rules);
 
   /**
    * @brief Launch the classification kernel on @a n_packets packets,
