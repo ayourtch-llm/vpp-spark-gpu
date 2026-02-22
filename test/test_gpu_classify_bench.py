@@ -9,11 +9,20 @@ packet generator in sustained generator mode.  No Python round-trips occur
 between frames during the timed phase — VPP's pg runs N_REPS × BATCH
 packets continuously and we measure wall-clock elapsed time.
 
-Three scenarios, each run at rule counts {1, 8, 32, 64}:
+The "kern μs" column reports the GPU's own internal measurement of the
+dispatch round-trip (cpu → gpu → cpu), obtained from "show gpu-classify"
+via clock_gettime() inside gpu_classify_launch_kernel().  It excludes all
+VPP feature-arc and buffer-management overhead.  The difference between
+"GPU μs/fr" (wall-clock frame time) and "kern μs" is VPP overhead.
 
-  no-match    N deny rules; traffic matches none       → full linear scan
-  first-match N rules;      traffic matches rule 0     → exits after 1 compare
-  last-match  N rules;      traffic matches rule N-1   → full linear scan + match
+Four scenarios, each run at rule counts {1, 8, 32, 64}:
+
+  no-match      N deny rules; traffic matches none     → full linear scan
+  first-match   N rules;      traffic matches rule 0   → exits after 1 compare
+  last-match    N rules;      traffic matches rule N-1 → full linear scan + match
+  diverse-pfx   N dst-prefix rules cycling /8→/16→/24→/32;
+                traffic matches none.  ACL plugin builds one hash table per
+                unique prefix length (up to 4); GPU still scans linearly.
 
 GPU  action for "matching" rules  → MARK  (packet forwarded)
 ACL  action for "matching" rules  → PERMIT (packet forwarded)
@@ -25,8 +34,10 @@ Run with::
 """
 
 import os
+import re
 import time
 import unittest
+from ipaddress import IPv4Network
 
 from config import config
 from framework import VppTestCase
@@ -70,6 +81,45 @@ class TestGpuClassifyBench(VppTestCase):
     DENY_PORT_BASE  = 5000
     MATCH_PORT_BASE = 9000
     PASS_PORT       = 1234
+
+    # Scenario 4: diverse dst prefix lengths.
+    #
+    # N_RULES_DIVERSE rules are always installed; what varies is how many
+    # *distinct prefix lengths* (mask types) those rules span.  The ACL
+    # plugin builds one hash table per unique dst-prefix mask, so its cost
+    # grows with mask diversity.  The GPU scans all N rules linearly —
+    # its cost is independent of mask diversity.
+    #
+    # MASK_COUNTS = [1, 2, 4, 8] — number of distinct prefix lengths used.
+    # All rules split evenly across the chosen lengths:
+    #   mask_count=1 →  64 rules of /8  only        →  1 ACL table
+    #   mask_count=2 →  32 rules /8  + 32 rules /16  →  2 ACL tables
+    #   mask_count=4 →  16 rules each /8,/12,/16,/20  →  4 ACL tables
+    #   mask_count=8 →   8 rules each /8,/12,…,/32  →  8 ACL tables
+    #
+    # Prefix pools: 64 non-overlapping prefixes per length, all outside
+    # 172.16.x.x (the pg test subnet):
+    #   /8 : 20.0.0.0/8 … 83.0.0.0/8   (first octets 20–83)
+    #   /12: 40.0.0.0/12, 40.16.0.0/12, …  (cycling octets 40–43)
+    #   /16: 100.0.0.0/16 … 100.63.0.0/16
+    #   /20: 101.0.0.0/20, 101.0.16.0/20, … (101.0–3 × 16 subnets)
+    #   /24: 102.0.0.0/24 … 102.0.63.0/24
+    #   /28: 103.0.0.0/28, 103.0.0.16/28, … (103.0.0–3 × 16 subnets)
+    #   /30: 104.0.0.0/30 … 104.0.0.252/30  (steps of 4)
+    #   /32: 105.0.0.1/32 … 105.0.0.64/32
+    N_RULES_DIVERSE = 64
+    MASK_COUNTS     = [1, 2, 4, 8]
+    LENGTHS_ALL     = [8, 12, 16, 20, 24, 28, 30, 32]   # 8 possible lengths
+    _PFX = {
+        8:  [f"{20+i}.0.0.0/8"                for i in range(64)],
+        12: [f"{40+i//16}.{(i%16)*16}.0.0/12" for i in range(64)],
+        16: [f"100.{i}.0.0/16"                for i in range(64)],
+        20: [f"101.{i//16}.{(i%16)*16}.0/20"  for i in range(64)],
+        24: [f"102.0.{i}.0/24"                for i in range(64)],
+        28: [f"103.0.{i//16}.{(i%16)*16}/28"  for i in range(64)],
+        30: [f"104.0.{i//64}.{(i%64)*4}/30"   for i in range(64)],
+        32: [f"105.0.0.{i+1}/32"              for i in range(64)],
+    }
 
     # ------------------------------------------------------------------
     # Class-level setup
@@ -295,6 +345,57 @@ class TestGpuClassifyBench(VppTestCase):
             f"gpu-classify rule add proto 6 dport {dport} action {action}"
         )
 
+    def _gpu_rule_prefix(self, prefix, action="drop"):
+        """Add a GPU deny rule matching *only* a dst IP prefix (any proto/port)."""
+        self.vapi.cli(f"gpu-classify rule add dst {prefix} action {action}")
+
+    def _gpu_snapshot(self):
+        """Parse 'show gpu-classify' and return kernel timing stats.
+
+        Returns a dict with keys:
+          calls   — cumulative frame count (n_kernel_calls)
+          avg_us  — cumulative average kernel round-trip (µs)
+          p50_us  — cumulative p50 latency (µs)
+          p99_us  — cumulative p99 latency (µs)
+
+        All fields are 0.0 / 0 if no frames have been processed yet.
+        """
+        out = self.vapi.cli("show gpu-classify")
+        snap = {"calls": 0, "avg_us": 0.0, "p50_us": 0.0, "p99_us": 0.0}
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("Frames"):
+                m = re.search(r":\s*(\d+)", line)
+                if m:
+                    snap["calls"] = int(m.group(1))
+            elif line.startswith("Latency"):
+                m = re.search(r"avg\s+([\d.]+)\s+us", line)
+                if m:
+                    snap["avg_us"] = float(m.group(1))
+            elif line.startswith("Pctiles"):
+                m = re.search(
+                    r"p50\s+([\d.]+)\s+us.*p99\s+([\d.]+)\s+us", line
+                )
+                if m:
+                    snap["p50_us"] = float(m.group(1))
+                    snap["p99_us"] = float(m.group(2))
+        return snap
+
+    def _gpu_delta_avg(self, before, after):
+        """Return average kernel latency (µs) for frames between two snapshots.
+
+        Uses the cumulative (calls × avg) totals to compute an exact weighted
+        average for only the frames that happened between *before* and *after*.
+        Returns None if no frames were processed in the interval.
+        """
+        delta_calls = after["calls"] - before["calls"]
+        if delta_calls <= 0:
+            return None
+        # total_ms = avg_us * calls / 1000 (exact inverse of how avg is stored)
+        total_ms_before = before["avg_us"] * before["calls"] / 1000.0
+        total_ms_after  = after["avg_us"]  * after["calls"]  / 1000.0
+        return (total_ms_after - total_ms_before) / delta_calls * 1000.0
+
     # ------------------------------------------------------------------
     # ACL helpers
     # ------------------------------------------------------------------
@@ -330,34 +431,42 @@ class TestGpuClassifyBench(VppTestCase):
             is_permit=1, proto=6, dport_from=dport, dport_to=dport
         )
 
+    def _acl_deny_prefix(self, prefix):
+        """Return a stateless deny rule matching a dst IP prefix (any proto/port)."""
+        return AclRule(is_permit=0, dst_prefix=IPv4Network(prefix))
+
     # ------------------------------------------------------------------
-    # Results table
+    # Results table helpers
     # ------------------------------------------------------------------
 
     @staticmethod
     def _print_header(title):
-        w = 80
+        w = 88
         sep = "=" * w
         print(f"\n{sep}")
         print(f"  {title}")
         print(sep)
         print(
             f"  {'Rules':>6}  "
-            f"{'GPU Mpps':>10}  {'GPU μs/fr':>10}  "
+            f"{'GPU Mpps':>10}  {'GPU μs/fr':>10}  {'kern μs':>8}  "
             f"{'ACL Mpps':>10}  {'ACL μs/fr':>10}  "
             f"{'GPU/ACL':>8}"
         )
         print(
-            f"  {'-'*6}  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*8}"
+            f"  {'-'*6}  {'-'*10}  {'-'*10}  {'-'*8}  "
+            f"{'-'*10}  {'-'*10}  {'-'*8}"
         )
 
     @staticmethod
-    def _print_row(n_rules, gpu_mpps, gpu_us, acl_mpps, acl_us):
+    def _print_row(n_rules, gpu_mpps, gpu_us, kern_us, acl_mpps, acl_us):
         def fmt_mpps(v):
             return f"{v:10.3f}" if v is not None else f"{'n/a':>10}"
 
         def fmt_us(v):
             return f"{v:10.1f}" if v is not None else f"{'n/a':>10}"
+
+        def fmt_kern(v):
+            return f"{v:8.1f}" if v is not None else f"{'n/a':>8}"
 
         if gpu_mpps is not None and acl_mpps is not None:
             ratio = f"{gpu_mpps / acl_mpps:7.2f}x"
@@ -366,9 +475,17 @@ class TestGpuClassifyBench(VppTestCase):
 
         print(
             f"  {n_rules:>6}  "
-            f"{fmt_mpps(gpu_mpps)}  {fmt_us(gpu_us)}  "
+            f"{fmt_mpps(gpu_mpps)}  {fmt_us(gpu_us)}  {fmt_kern(kern_us)}  "
             f"{fmt_mpps(acl_mpps)}  {fmt_us(acl_us)}  "
             f"{ratio:>8}"
+        )
+
+    @staticmethod
+    def _print_kern_note():
+        print(
+            "  (kern μs = GPU dispatch round-trip only, "
+            "from clock_gettime inside gpu_classify_launch_kernel;\n"
+            "   GPU μs/fr − kern μs = VPP feature-arc + buffer overhead)"
         )
 
     # ==================================================================
@@ -390,14 +507,17 @@ class TestGpuClassifyBench(VppTestCase):
         )
 
         for n in self.RULE_COUNTS:
-            gpu_mpps = gpu_us = acl_mpps = acl_us = None
+            gpu_mpps = gpu_us = kern_us = acl_mpps = acl_us = None
 
             # ---- GPU ----
             if self.gpu_available:
                 self._gpu_enable()
                 for i in range(n):
                     self._gpu_rule(self.DENY_PORT_BASE + i, "drop")
+                snap0 = self._gpu_snapshot()
                 gpu_mpps, gpu_us = self._time_pg(pkts)
+                snap1 = self._gpu_snapshot()
+                kern_us = self._gpu_delta_avg(snap0, snap1)
                 self._gpu_disable()
 
             # ---- ACL ----
@@ -410,7 +530,9 @@ class TestGpuClassifyBench(VppTestCase):
                 acl_mpps, acl_us = self._time_pg(pkts)
                 self._acl_remove()
 
-            self._print_row(n, gpu_mpps, gpu_us, acl_mpps, acl_us)
+            self._print_row(n, gpu_mpps, gpu_us, kern_us, acl_mpps, acl_us)
+
+        self._print_kern_note()
 
     # ==================================================================
     # Benchmark 2 — first-rule match (best case for linear scan)
@@ -433,7 +555,7 @@ class TestGpuClassifyBench(VppTestCase):
         )
 
         for n in self.RULE_COUNTS:
-            gpu_mpps = gpu_us = acl_mpps = acl_us = None
+            gpu_mpps = gpu_us = kern_us = acl_mpps = acl_us = None
 
             # ---- GPU ----
             if self.gpu_available:
@@ -441,7 +563,10 @@ class TestGpuClassifyBench(VppTestCase):
                 self._gpu_rule(match_port, "mark")   # rule 0: MARK → forwarded
                 for i in range(1, n):
                     self._gpu_rule(self.DENY_PORT_BASE + i, "drop")
+                snap0 = self._gpu_snapshot()
                 gpu_mpps, gpu_us = self._time_pg(pkts)
+                snap1 = self._gpu_snapshot()
+                kern_us = self._gpu_delta_avg(snap0, snap1)
                 self._gpu_disable()
 
             # ---- ACL ----
@@ -455,7 +580,9 @@ class TestGpuClassifyBench(VppTestCase):
                 acl_mpps, acl_us = self._time_pg(pkts)
                 self._acl_remove()
 
-            self._print_row(n, gpu_mpps, gpu_us, acl_mpps, acl_us)
+            self._print_row(n, gpu_mpps, gpu_us, kern_us, acl_mpps, acl_us)
+
+        self._print_kern_note()
 
     # ==================================================================
     # Benchmark 3 — last-rule match (full scan before finding a match)
@@ -478,7 +605,7 @@ class TestGpuClassifyBench(VppTestCase):
         )
 
         for n in self.RULE_COUNTS:
-            gpu_mpps = gpu_us = acl_mpps = acl_us = None
+            gpu_mpps = gpu_us = kern_us = acl_mpps = acl_us = None
             match_port = self.MATCH_PORT_BASE + n - 1
             pkts = self._pkts(match_port)
 
@@ -488,7 +615,10 @@ class TestGpuClassifyBench(VppTestCase):
                 for i in range(n - 1):
                     self._gpu_rule(self.DENY_PORT_BASE + i, "drop")
                 self._gpu_rule(match_port, "mark")   # rule N-1: MARK → forwarded
+                snap0 = self._gpu_snapshot()
                 gpu_mpps, gpu_us = self._time_pg(pkts)
+                snap1 = self._gpu_snapshot()
+                kern_us = self._gpu_delta_avg(snap0, snap1)
                 self._gpu_disable()
 
             # ---- ACL ----
@@ -502,7 +632,119 @@ class TestGpuClassifyBench(VppTestCase):
                 acl_mpps, acl_us = self._time_pg(pkts)
                 self._acl_remove()
 
-            self._print_row(n, gpu_mpps, gpu_us, acl_mpps, acl_us)
+            self._print_row(n, gpu_mpps, gpu_us, kern_us, acl_mpps, acl_us)
+
+        self._print_kern_note()
+
+    # ==================================================================
+    # Benchmark 4 — fixed N rules, varying dst prefix length diversity
+    # ==================================================================
+
+    def test_bench_04_diverse_prefix(self):
+        """Benchmark: 64 rules, sweep distinct dst prefix lengths 1→2→4→8.
+
+        Total rules are always N_RULES_DIVERSE=64, split evenly across the
+        chosen number of distinct prefix lengths.  Traffic never matches any
+        rule (no-match / pass).
+
+        The ACL plugin builds one hash table per unique dst-prefix mask
+        (one per distinct prefix length), so lookup cost grows with mask
+        diversity while rule count stays constant.  The GPU always scans all
+        64 rules linearly; its cost is independent of mask diversity.
+
+        Expected trend:
+          ACL µs/fr  grows with mask count  (more hash-table probes per pkt)
+          GPU µs/fr  stays flat             (same 64 rules regardless)
+        """
+        pkts = self._pkts(self.PASS_PORT)
+
+        n_total_k = self.BATCH * self.N_REPS // 1000
+        w = 88
+        print(f"\n{'=' * w}")
+        print(
+            f"  Scenario 4 — diverse dst prefix lengths  "
+            f"({self.N_RULES_DIVERSE} rules total, no-match traffic;\n"
+            f"  {self.BATCH}-pkt frames, "
+            f"{self.N_REPS} reps = {n_total_k}k pkts per measurement)"
+        )
+        print('=' * w)
+        print(
+            f"  ACL builds 1 hash table per distinct dst-prefix length;\n"
+            f"  its per-packet cost grows linearly with mask count.\n"
+            f"  GPU always scans {self.N_RULES_DIVERSE} rules; cost is independent of mask diversity."
+        )
+        print(
+            f"\n  {'Masks':>6}  "
+            f"{'GPU Mpps':>10}  {'GPU μs/fr':>10}  {'kern μs':>8}  "
+            f"{'ACL Mpps':>10}  {'ACL μs/fr':>10}  "
+            f"{'GPU/ACL':>8}  "
+            f"{'Lengths used'}"
+        )
+        print(
+            f"  {'-'*6}  {'-'*10}  {'-'*10}  {'-'*8}  "
+            f"{'-'*10}  {'-'*10}  {'-'*8}  "
+            f"{'-'*20}"
+        )
+
+        for mask_count in self.MASK_COUNTS:
+            gpu_mpps = gpu_us = kern_us = acl_mpps = acl_us = None
+
+            # Choose the first mask_count lengths; split 64 rules evenly.
+            lengths   = self.LENGTHS_ALL[:mask_count]
+            n_per_len = self.N_RULES_DIVERSE // mask_count
+            prefixes  = []
+            for j, plen in enumerate(lengths):
+                prefixes += self._PFX[plen][:n_per_len]
+
+            lengths_str = "+".join(f"/{l}" for l in lengths)
+
+            # ---- GPU ----
+            if self.gpu_available:
+                self._gpu_enable()
+                for pfx in prefixes:
+                    self._gpu_rule_prefix(pfx, "drop")
+                snap0 = self._gpu_snapshot()
+                gpu_mpps, gpu_us = self._time_pg(pkts)
+                snap1 = self._gpu_snapshot()
+                kern_us = self._gpu_delta_avg(snap0, snap1)
+                self._gpu_disable()
+
+            # ---- ACL ----
+            if self.acl_available:
+                rules = (
+                    [self._acl_deny_prefix(pfx) for pfx in prefixes]
+                    + [AclRule(is_permit=1)]   # permit-all fallthrough
+                )
+                self._acl_install(rules)
+                acl_mpps, acl_us = self._time_pg(pkts)
+                self._acl_remove()
+
+            # Print row with an extra column showing which lengths were used.
+            def fmt_mpps(v):
+                return f"{v:10.3f}" if v is not None else f"{'n/a':>10}"
+            def fmt_us(v):
+                return f"{v:10.1f}" if v is not None else f"{'n/a':>10}"
+            def fmt_kern(v):
+                return f"{v:8.1f}" if v is not None else f"{'n/a':>8}"
+
+            if gpu_mpps is not None and acl_mpps is not None:
+                ratio = f"{gpu_mpps / acl_mpps:7.2f}x"
+            else:
+                ratio = f"{'n/a':>8}"
+
+            print(
+                f"  {mask_count:>6}  "
+                f"{fmt_mpps(gpu_mpps)}  {fmt_us(gpu_us)}  {fmt_kern(kern_us)}  "
+                f"{fmt_mpps(acl_mpps)}  {fmt_us(acl_us)}  "
+                f"{ratio:>8}  "
+                f"{lengths_str}"
+            )
+
+        self._print_kern_note()
+        print(
+            f"  Note: 'Masks' = number of distinct dst prefix lengths in the rule set.\n"
+            f"  All rows have exactly {self.N_RULES_DIVERSE} rules; only mask diversity varies."
+        )
 
 
 if __name__ == "__main__":
