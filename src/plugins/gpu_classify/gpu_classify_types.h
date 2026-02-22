@@ -18,7 +18,7 @@
 /* ------------------------------------------------------------------ */
 
 /** Maximum number of classification rules held in GPU constant memory.
- *  64 rules × 24 bytes = 1 536 bytes (well within the 64 KB limit).  */
+ *  64 rules × 80 bytes = 5 120 bytes (well within the 64 KB limit).  */
 #define GPU_CLASSIFY_MAX_RULES  64
 
 /** Maximum packets per VPP frame (== VLIB_FRAME_SIZE).               */
@@ -43,58 +43,71 @@
 #define GPU_CLASSIFY_ACTION_MARK  2   /**< set flag and forward        */
 
 /* ------------------------------------------------------------------ */
-/* Packet descriptor — 32 bytes, cache-line–friendly                  */
+/* Packet descriptor — 64 bytes, one full cache line                  */
 /* ------------------------------------------------------------------ */
 
 /**
  * @brief Compact per-packet descriptor filled by the CPU and read by
  *        the GPU kernel.
  *
- * 32 bytes total: one naturally-aligned 32-byte block per thread.
+ * 64 bytes total (one cache line).
  * All multi-byte fields are in **network byte order**, consistent with
  * the raw packet bytes the CPU reads out of vlib_buffer_t.
+ *
+ * IPv4 packets store the 4-byte address in src_ip[0..3]; bytes [4..15]
+ * are zeroed.  IPv6 packets use all 16 bytes of src_ip / dst_ip.
  */
 typedef struct
 {
-  uint32_t src_ip4;     /**< Source IPv4 address (network byte order)      */
-  uint32_t dst_ip4;     /**< Destination IPv4 address (network byte order) */
-  uint16_t src_port;    /**< Source L4 port (network byte order)            */
-  uint16_t dst_port;    /**< Destination L4 port (network byte order)       */
-  uint8_t  ip_proto;    /**< IP protocol number (TCP=6, UDP=17, …)         */
-  uint8_t  tcp_flags;   /**< TCP flags byte; 0 for non-TCP packets          */
-  uint8_t  ip_version;  /**< IP version: 4 (IPv6 reserved for future)       */
-  uint8_t  valid;       /**< 1 = slot is populated; 0 = padding             */
-  uint8_t  payload[16]; /**< First 16 bytes after the L4 header             */
-  /*                         ───────────────────────────────────────── 32 B */
+  uint8_t  src_ip[16];  /**< Source IP address (4 or 16 bytes, NBO)      */
+  uint8_t  dst_ip[16];  /**< Destination IP address (4 or 16 bytes, NBO) */
+  uint16_t src_port;    /**< Source L4 port (network byte order)          */
+  uint16_t dst_port;    /**< Destination L4 port (network byte order)     */
+  uint8_t  ip_proto;    /**< IP protocol number (TCP=6, UDP=17, …)       */
+  uint8_t  tcp_flags;   /**< TCP flags byte; 0 for non-TCP packets        */
+  uint8_t  ip_version;  /**< IP version: 4 or 6                          */
+  uint8_t  valid;       /**< 1 = slot is populated; 0 = padding           */
+  uint8_t  payload[16]; /**< First 16 bytes after the L4 header           */
+  uint8_t  _pad[8];     /**< Explicit padding to reach 64 bytes           */
+  /*                         ───────────────────────────────────────── 64 B */
 } gpu_pkt_desc_t;
 
 /* ------------------------------------------------------------------ */
-/* Classification rule — 24 bytes                                     */
+/* Classification rule — 80 bytes                                     */
 /* ------------------------------------------------------------------ */
 
 /**
  * @brief One classification rule stored in GPU constant memory.
  *
  * Field semantics:
- *  - A zero value in src_mask/dst_mask means "any source/dest IP".
+ *  - ip_version: 4, 6, or 0 (0 = match any IP version).
+ *  - Zero src_mask/dst_mask bytes mean "any source/dest IP" for those
+ *    bytes; a fully-zero mask matches any address (wildcard).
  *  - A zero value in src_port/dst_port means "any port".
  *  - A zero value in proto means "any protocol".
  *  - tcp_flags_mask == 0 means "don't check TCP flags".
+ *
+ * IPv4 rules store a 4-byte address in addr[0..3]; bytes [4..15] are
+ * zeroed.  IPv6 rules use all 16 bytes.  The ip_version field prevents
+ * cross-version false matches when the ip_matches() helper is used.
+ *
  * All address/port fields are in **network byte order**.
  */
 typedef struct
 {
-  uint32_t src_addr;       /**< Source IP prefix (net byte order)           */
-  uint32_t src_mask;       /**< Source prefix mask  (0 = wildcard)          */
-  uint32_t dst_addr;       /**< Destination IP prefix (net byte order)      */
-  uint32_t dst_mask;       /**< Destination prefix mask (0 = wildcard)      */
-  uint16_t src_port;       /**< Source port to match    (0 = wildcard)      */
-  uint16_t dst_port;       /**< Destination port to match (0 = wildcard)    */
-  uint8_t  proto;          /**< IP protocol to match    (0 = wildcard)      */
-  uint8_t  action;         /**< Action on match: GPU_CLASSIFY_ACTION_*      */
-  uint8_t  tcp_flags_mask; /**< Bits to check in TCP flags (0 = skip)       */
-  uint8_t  tcp_flags_val;  /**< Expected value after masking                */
-  /*                         ───────────────────────────────────────── 24 B */
+  uint8_t  src_addr[16];     /**< Source IP prefix (net byte order)       */
+  uint8_t  src_mask[16];     /**< Source prefix mask  (0 = wildcard)      */
+  uint8_t  dst_addr[16];     /**< Destination IP prefix (net byte order)  */
+  uint8_t  dst_mask[16];     /**< Destination prefix mask (0 = wildcard)  */
+  uint16_t src_port;         /**< Source port to match    (0 = wildcard)  */
+  uint16_t dst_port;         /**< Destination port to match (0 = wildcard)*/
+  uint8_t  proto;            /**< IP protocol to match    (0 = wildcard)  */
+  uint8_t  action;           /**< Action on match: GPU_CLASSIFY_ACTION_*  */
+  uint8_t  tcp_flags_mask;   /**< Bits to check in TCP flags (0 = skip)   */
+  uint8_t  tcp_flags_val;    /**< Expected value after masking             */
+  uint8_t  ip_version;       /**< IP version to match: 4, 6, or 0 (any)  */
+  uint8_t  _pad[7];          /**< Explicit padding to reach 80 bytes      */
+  /*                         ───────────────────────────────────────── 80 B */
 } gpu_classify_rule_t;
 
 /* ------------------------------------------------------------------ */

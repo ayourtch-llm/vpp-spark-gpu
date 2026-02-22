@@ -3,9 +3,10 @@
 """
 VPP GPU Packet Classifier Plugin — test suite.
 
-Tests the ``gpu-classify-ip4`` graph node on the ``ip4-unicast`` feature arc.
-Exercises DROP, PASS, MARK actions and various rule predicates using the VPP
-packet-generator interface and the standard VppTestCase infrastructure.
+Tests the ``gpu-classify-ip4`` (ip4-unicast) and ``gpu-classify-ip6``
+(ip6-unicast) graph nodes.  Exercises DROP, PASS, MARK actions and
+various rule predicates using the VPP packet-generator interface and
+the standard VppTestCase infrastructure.
 
 Hardware target: NVIDIA Blackwell GB10 (DGX Spark, NVLink-C2C).
 The plugin must be compiled with CUDA support (nvcc, sm_100) and the NVIDIA
@@ -27,6 +28,7 @@ from asfframework import VppTestRunner
 
 from scapy.layers.l2 import Ether
 from scapy.layers.inet import IP, TCP, UDP
+from scapy.layers.inet6 import IPv6
 from scapy.packet import Raw
 
 
@@ -41,22 +43,25 @@ from scapy.packet import Raw
     "gpu_classify plugin excluded from build — skipping GPU tests",
 )
 class TestGpuClassify(VppTestCase):
-    """GPU Packet Classifier — functional tests (ip4-unicast feature arc)"""
+    """GPU Packet Classifier — functional tests (ip4-unicast + ip6-unicast)"""
 
     # ------------------------------------------------------------------
     # Class-level setup: VPP interfaces configured once for all tests.
     #
-    #   pg0  — ingress interface  (gpu-classify-ip4 feature attached here)
+    #   pg0  — ingress interface  (gpu-classify features attached here)
     #   pg1  — egress  interface  (we capture packets forwarded by VPP)
     #
-    # The setup performs two availability probes that skip the whole
-    # class on non-GPU hardware without leaving VPP in a broken state:
+    # The setup performs availability probes that skip the whole class
+    # on non-GPU hardware without leaving VPP in a broken state:
     #
-    #   Probe 1 — try feature_enable_disable().
+    #   Probe 1 — try feature_enable_disable() for gpu-classify-ip4.
     #     Fails when the plugin .so was not built (no CUDA toolkit at
     #     compile time), because the feature node is never registered.
     #
-    #   Probe 2 — inspect "show gpu-classify" CLI output.
+    #   Probe 2 — try feature_enable_disable() for gpu-classify-ip6.
+    #     Same as probe 1 but for the IPv6 node.
+    #
+    #   Probe 3 — inspect "show gpu-classify" CLI output.
     #     Fails when the plugin was built but CUDA init failed at
     #     runtime (e.g. no GPU driver, or incompatible hardware).
     #     In this case the node passes all traffic through, so tests
@@ -72,13 +77,13 @@ class TestGpuClassify(VppTestCase):
                 iface.admin_up()
                 iface.config_ip4()   # assigns 172.16.x.y/24, creates connected route
                 iface.resolve_arp()  # teaches VPP the remote MAC for forwarding
+                iface.config_ip6()   # assigns IPv6 address, creates connected route
+                iface.resolve_ndp()  # teaches VPP the remote MAC via NDP
         except Exception:
             cls.tearDownClass()
             raise
 
-        # ── Probe 1: is the feature node registered? ──────────────────
-        # feature_enable_disable raises if "gpu-classify-ip4" is unknown
-        # (plugin .so not present because nvcc was absent at build time).
+        # ── Probe 1: is the ip4 feature node registered? ──────────────
         try:
             cls.vapi.feature_enable_disable(
                 enable=1,
@@ -86,7 +91,6 @@ class TestGpuClassify(VppTestCase):
                 feature_name="gpu-classify-ip4",
                 sw_if_index=cls.pg0.sw_if_index,
             )
-            # Immediately disable; setUp() will re-enable before each test.
             cls.vapi.feature_enable_disable(
                 enable=0,
                 arc_name="ip4-unicast",
@@ -100,9 +104,28 @@ class TestGpuClassify(VppTestCase):
                 f"plugin requires CUDA toolkit at build time ({e})"
             )
 
-        # ── Probe 2: did CUDA initialise successfully at runtime? ─────
-        # The node function passes traffic through without GPU inspection
-        # when cuda_ready == 0, so DROP/MARK tests would give wrong results.
+        # ── Probe 2: is the ip6 feature node registered? ──────────────
+        try:
+            cls.vapi.feature_enable_disable(
+                enable=1,
+                arc_name="ip6-unicast",
+                feature_name="gpu-classify-ip6",
+                sw_if_index=cls.pg0.sw_if_index,
+            )
+            cls.vapi.feature_enable_disable(
+                enable=0,
+                arc_name="ip6-unicast",
+                feature_name="gpu-classify-ip6",
+                sw_if_index=cls.pg0.sw_if_index,
+            )
+        except Exception as e:
+            cls.tearDownClass()
+            raise unittest.SkipTest(
+                f"gpu-classify-ip6 feature not registered — "
+                f"plugin requires CUDA toolkit at build time ({e})"
+            )
+
+        # ── Probe 3: did CUDA initialise successfully at runtime? ─────
         show_out = cls.vapi.cli("show gpu-classify")
         if "CUDA    : ready" not in show_out:
             cls.tearDownClass()
@@ -124,30 +147,40 @@ class TestGpuClassify(VppTestCase):
     def setUp(self):
         super().setUp()
 
-        # Enable the GPU classifier feature on pg0's ip4-unicast arc.
-        # Using the generic feature API so we don't depend on a vpp-papi
-        # binding for our plugin's own API (CLI-only plugin for now).
+        # Enable GPU classifier on both ip4-unicast and ip6-unicast arcs.
         self.vapi.feature_enable_disable(
             enable=1,
             arc_name="ip4-unicast",
             feature_name="gpu-classify-ip4",
             sw_if_index=self.pg0.sw_if_index,
         )
+        self.vapi.feature_enable_disable(
+            enable=1,
+            arc_name="ip6-unicast",
+            feature_name="gpu-classify-ip6",
+            sw_if_index=self.pg0.sw_if_index,
+        )
 
     def tearDown(self):
-        # Disable the feature and flush all rules between tests so each
-        # test starts from a clean state.
+        # Disable both features and flush all rules between tests so
+        # each test starts from a clean state.
         self.vapi.feature_enable_disable(
             enable=0,
             arc_name="ip4-unicast",
             feature_name="gpu-classify-ip4",
             sw_if_index=self.pg0.sw_if_index,
         )
+        self.vapi.feature_enable_disable(
+            enable=0,
+            arc_name="ip6-unicast",
+            feature_name="gpu-classify-ip6",
+            sw_if_index=self.pg0.sw_if_index,
+        )
         self.vapi.cli("gpu-classify rule clear")
         super().tearDown()
 
     # ------------------------------------------------------------------
-    # Packet helpers
+    # IPv4 packet helpers
     # ------------------------------------------------------------------
 
     def _pkt(self, proto="udp", src_ip=None, dst_ip=None,
@@ -171,13 +204,43 @@ class TestGpuClassify(VppTestCase):
         return [self._pkt(**kw) for _ in range(n)]
 
     # ------------------------------------------------------------------
-    # Helper: read a gpu-classify-ip4 error counter from the stats segment.
+    # IPv6 packet helpers
+    # ------------------------------------------------------------------
+
+    def _pkt6(self, proto="udp", src_ip=None, dst_ip=None,
+              sport=1234, dport=5000, tcp_flags="S", payload_size=64):
+        """Build an Ethernet/IPv6/TCP-or-UDP packet for the pg0→pg1 path."""
+        src = src_ip if src_ip is not None else self.pg0.remote_ip6
+        dst = dst_ip if dst_ip is not None else self.pg1.remote_ip6
+
+        eth = Ether(src=self.pg0.remote_mac, dst=self.pg0.local_mac)
+        ip6 = IPv6(src=src, dst=dst, hlim=64)
+
+        if proto == "tcp":
+            l4 = TCP(sport=sport, dport=dport, flags=tcp_flags)
+        else:
+            l4 = UDP(sport=sport, dport=dport)
+
+        return eth / ip6 / l4 / Raw(b"\xab" * payload_size)
+
+    def _pkts6(self, n, **kw):
+        """Return a list of *n* identical IPv6 packets built with _pkt6(**kw)."""
+        return [self._pkt6(**kw) for _ in range(n)]
+
+    # ------------------------------------------------------------------
+    # Error counter helpers
     # ------------------------------------------------------------------
 
     def _err(self, counter_name):
-        """Return the current absolute value of an error counter."""
+        """Return the current absolute value of a gpu-classify-ip4 counter."""
         return self.statistics.get_err_counter(
             f"/err/gpu-classify-ip4/{counter_name}"
+        )
+
+    def _err6(self, counter_name):
+        """Return the current absolute value of a gpu-classify-ip6 counter."""
+        return self.statistics.get_err_counter(
+            f"/err/gpu-classify-ip6/{counter_name}"
         )
 
     # ==================================================================
@@ -535,7 +598,7 @@ class TestGpuClassify(VppTestCase):
             "gpu-classify rule add proto 17 dport 9999 action drop"
         )
 
-        # Disable the feature (tearDown will also disable it, that is fine).
+        # Disable the ip4 feature (tearDown will also disable it; that is fine).
         self.vapi.feature_enable_disable(
             enable=0,
             arc_name="ip4-unicast",
@@ -591,6 +654,136 @@ class TestGpuClassify(VppTestCase):
             self.pg0, self._pkts(4, proto="udp", dport=99), self.pg1
         )
         self.assertEqual(len(rx), 4)
+
+    # ==================================================================
+    # Test 15 — IPv6 baseline pass-through (no rules)
+    # ==================================================================
+
+    def test_15_ipv6_pass_no_rules(self):
+        """With zero rules every IPv6 packet should pass to the next feature."""
+        N  = 8
+        rx = self.send_and_expect(self.pg0, self._pkts6(N), self.pg1)
+        self.assertEqual(
+            len(rx), N, f"Expected {N} IPv6 packets to pass; got {len(rx)}"
+        )
+
+    # ==================================================================
+    # Test 16 — IPv6 DROP by destination /32 prefix
+    # ==================================================================
+
+    def test_16_ipv6_drop_by_dst_prefix(self):
+        """IPv6 packets with dst in 2001:db8::/32 are dropped by the GPU.
+        The GPU drop counter must increment to confirm GPU handled the drop."""
+        self.vapi.cli("gpu-classify rule add dst 2001:db8::/32 action drop")
+
+        N_drop = 6
+        N_pass = 4
+
+        before_drop = self._err6("Packets dropped by GPU classifier")
+
+        self.send_and_assert_no_replies(
+            self.pg0,
+            self._pkts6(N_drop, dst_ip="2001:db8::1"),
+            "IPv6 dst in 2001:db8::/32 should be dropped",
+        )
+
+        after_drop = self._err6("Packets dropped by GPU classifier")
+        self.assertEqual(
+            after_drop - before_drop,
+            N_drop,
+            "GPU drop counter must rise by N_drop",
+        )
+
+        # Packets to pg1.remote_ip6 (different prefix) must pass.
+        rx = self.send_and_expect(self.pg0, self._pkts6(N_pass), self.pg1)
+        self.assertEqual(len(rx), N_pass)
+
+    # ==================================================================
+    # Test 17 — IPv6 DROP by destination port (TCP)
+    # ==================================================================
+
+    def test_17_ipv6_drop_by_dport(self):
+        """IPv6/TCP packets to port 8080 are dropped; port 80 passes."""
+        self.vapi.cli(
+            "gpu-classify rule add proto 6 dport 8080 action drop"
+        )
+
+        N_drop = 5
+        N_pass = 5
+
+        self.send_and_assert_no_replies(
+            self.pg0,
+            self._pkts6(N_drop, proto="tcp", dport=8080),
+            "IPv6 TCP dport 8080 should be dropped",
+        )
+
+        rx = self.send_and_expect(
+            self.pg0, self._pkts6(N_pass, proto="tcp", dport=80), self.pg1
+        )
+        self.assertEqual(len(rx), N_pass)
+
+    # ==================================================================
+    # Test 18 — IPv6 MARK: counter increments, packets forwarded
+    # ==================================================================
+
+    def test_18_ipv6_mark(self):
+        """IPv6 packets matching a /128 src rule are MARKed and forwarded.
+        The gpu-classify-ip6 mark counter must rise by exactly N."""
+        self.vapi.cli(
+            f"gpu-classify rule add src {self.pg0.remote_ip6}/128 action mark"
+        )
+
+        N = 10
+
+        before_mark = self._err6("Packets marked by GPU classifier")
+
+        rx = self.send_and_expect(self.pg0, self._pkts6(N), self.pg1)
+        self.assertEqual(len(rx), N, "MARK packets must still be forwarded")
+
+        after_mark = self._err6("Packets marked by GPU classifier")
+        self.assertEqual(
+            after_mark - before_mark,
+            N,
+            f"Mark counter should rise by {N}; rose by {after_mark - before_mark}",
+        )
+
+    # ==================================================================
+    # Test 19 — ip_version=0 rule matches both IPv4 and IPv6 traffic
+    # ==================================================================
+
+    def test_19_proto_wildcard_matches_both_versions(self):
+        """A rule with no address fields (ip_version=0) fires on packets
+        of both IP versions processed by their respective nodes."""
+        self.vapi.cli(
+            "gpu-classify rule add proto 17 dport 9999 action drop"
+        )
+
+        N = 4
+
+        # IPv4/UDP dport 9999 → dropped by gpu-classify-ip4.
+        self.send_and_assert_no_replies(
+            self.pg0,
+            self._pkts(N, proto="udp", dport=9999),
+            "IPv4 UDP dport 9999 must be dropped by version-0 rule",
+        )
+
+        # IPv6/UDP dport 9999 → dropped by gpu-classify-ip6.
+        self.send_and_assert_no_replies(
+            self.pg0,
+            self._pkts6(N, proto="udp", dport=9999),
+            "IPv6 UDP dport 9999 must be dropped by version-0 rule",
+        )
+
+        # Different port → pass for both versions.
+        rx4 = self.send_and_expect(
+            self.pg0, self._pkts(N, proto="udp", dport=8888), self.pg1
+        )
+        self.assertEqual(len(rx4), N, "IPv4 dport 8888 must pass")
+
+        rx6 = self.send_and_expect(
+            self.pg0, self._pkts6(N, proto="udp", dport=8888), self.pg1
+        )
+        self.assertEqual(len(rx6), N, "IPv6 dport 8888 must pass")
 
 
 if __name__ == "__main__":

@@ -5,32 +5,55 @@
 # Target: NVIDIA Blackwell GB10 (DGX Spark, NVLink-C2C), sm_100.
 #
 # CUDA toolkit installation hint (Ubuntu 24.04 aarch64/SBSA):
-#   wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
-#   dpkg -i cuda-keyring_1.1-1_all.deb && apt-get update
+#   curl -fsSL -o /tmp/cuda-keyring.deb \
+#     https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
+#   dpkg -i /tmp/cuda-keyring.deb && apt-get update
 #   apt-get install -y cuda-toolkit-12-8
-# Then build VPP with:
-#   export PATH=/usr/local/cuda-12.8/bin:$PATH
-#   make build
+# Then simply run: make build-release   (no PATH changes needed)
 
 # ------------------------------------------------------------------ #
-# Locate nvcc                                                          #
+# Locate nvcc — fully automatic, no PATH setup required              #
+#                                                                      #
+# file(GLOB ... CONFIGURE_DEPENDS) is re-evaluated on every           #
+# "cmake --build" invocation.  When nvcc appears in a standard        #
+# location (e.g. after installing cuda-toolkit-12-8), cmake detects   #
+# the change and retriggers configuration automatically — the user     #
+# just needs to re-run "make build-release".                          #
 # ------------------------------------------------------------------ #
 
-if (NOT DEFINED CMAKE_CUDA_COMPILER)
-  find_program (CMAKE_CUDA_COMPILER NAMES nvcc
-    PATHS
-      /usr/local/cuda/bin
-      /usr/local/cuda-12.8/bin
-      /usr/local/cuda-13.0/bin
-    NO_DEFAULT_PATH)
+file(GLOB _nvcc_candidates LIST_DIRECTORIES false CONFIGURE_DEPENDS
+  "/usr/local/cuda/bin/nvcc"
+  "/usr/local/cuda-*/bin/nvcc"
+)
+
+if (_nvcc_candidates)
+  # If multiple toolkits are installed, prefer the newest version.
+  list(SORT _nvcc_candidates ORDER DESCENDING)
+  list(GET _nvcc_candidates 0 _nvcc_path)
 endif ()
 
-if (NOT CMAKE_CUDA_COMPILER)
+# Fallback: search directories listed in PATH (handles non-standard installs).
+if (NOT _nvcc_path)
+  find_program(_nvcc_path_tmp NAMES nvcc)
+  if (_nvcc_path_tmp)
+    set(_nvcc_path "${_nvcc_path_tmp}")
+  endif ()
+  unset(_nvcc_path_tmp CACHE)   # don't let find_program cache a stale result
+endif ()
+
+if (NOT _nvcc_path)
   message (WARNING
     "nvcc not found — gpu_classify plugin disabled. "
-    "Install cuda-toolkit-12-8 and add its bin/ to PATH.")
+    "Install cuda-toolkit-12-8 and re-run make build-release "
+    "(cmake will detect the toolkit automatically).")
   return ()
 endif ()
+
+# Force-update CMAKE_CUDA_COMPILER so a stale NOTFOUND cache entry
+# from a previous configure (run before the toolkit was installed)
+# does not prevent the plugin from being built.
+set (CMAKE_CUDA_COMPILER "${_nvcc_path}" CACHE FILEPATH
+  "CUDA compiler (nvcc)" FORCE)
 
 message (STATUS "gpu_classify: using nvcc at ${CMAKE_CUDA_COMPILER}")
 enable_language (CUDA)

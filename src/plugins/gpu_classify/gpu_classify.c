@@ -2,13 +2,17 @@
  * GPU Packet Classifier — plugin init, CLI commands.
  *
  * Provides:
- *   gpu-classify enable <interface> [disable]
+ *   gpu-classify enable <interface> [ip4] [ip6] [disable]
  *   gpu-classify rule add [proto <p>] [src <addr/len>] [dst <addr/len>]
  *                         [sport <port>] [dport <port>]
  *                         [tcpflags <mask> <val>]
  *                         action {pass|drop|mark}
  *   gpu-classify rule clear
- *   gpu-classify show
+ *   show gpu-classify
+ *
+ * src/dst addresses are auto-detected: dotted-decimal → IPv4,
+ * colon-hex → IPv6.  Rules with no address fields set ip_version=0
+ * (match any IP version).
  */
 
 #include <vlib/vlib.h>
@@ -16,8 +20,10 @@
 #include <vnet/plugin/plugin.h>
 #include <vnet/feature/feature.h>
 #include <vnet/ip/ip4_packet.h>
+#include <vnet/ip/ip6_packet.h>
 #include <vppinfra/error.h>
 #include <vppinfra/format.h>
+#include <vpp/app/version.h>
 
 #include <gpu_classify/gpu_classify.h>
 
@@ -114,13 +120,57 @@ lat_hist_percentile (u64 *hist, u64 total, double pct)
   return lo[GPU_CLASSIFY_LAT_BUCKETS - 1]; /* unreachable */
 }
 
-/** Convert a prefix length (0-32) to a network-byte-order mask. */
+/** Convert a prefix length (0-32) to a network-byte-order IPv4 mask. */
 static u32
 prefixlen_to_mask (u32 prefixlen)
 {
   if (prefixlen == 0)
     return 0;
   return clib_host_to_net_u32 (~0u << (32 - prefixlen));
+}
+
+/**
+ * Fill a 16-byte buffer with the IPv6 network mask for @a plen (0–128).
+ * Full bytes are set to 0xff; the partial byte (if any) has leading 1s.
+ */
+static void
+prefixlen6_to_mask (u32 plen, u8 *mask)
+{
+  clib_memset (mask, 0, 16);
+  u32 full_bytes = plen / 8;
+  u32 rem_bits   = plen % 8;
+
+  for (u32 i = 0; i < full_bytes; i++)
+    mask[i] = 0xff;
+  if (rem_bits)
+    mask[full_bytes] = (u8) (0xff << (8 - rem_bits));
+}
+
+/**
+ * Count the number of leading 1-bits in an @a nbytes mask.
+ * Used to convert a network mask back to a prefix length for display.
+ */
+static u32
+mask_to_plen (const u8 *mask, int nbytes)
+{
+  u32 plen = 0;
+  for (int i = 0; i < nbytes; i++)
+    {
+      if (mask[i] == 0xff)
+	{
+	  plen += 8;
+	  continue;
+	}
+      /* Count leading 1-bits in the partial byte. */
+      u8 b = mask[i];
+      while (b & 0x80)
+	{
+	  plen++;
+	  b <<= 1;
+	}
+      break;
+    }
+  return plen;
 }
 
 /** Push the current CPU rule set to GPU constant memory. */
@@ -131,7 +181,7 @@ sync_rules_to_gpu (gpu_classify_main_t *gcm)
 }
 
 /* ------------------------------------------------------------------ */
-/* CLI: gpu-classify enable <if> [disable]                            */
+/* CLI: gpu-classify enable <if> [ip4] [ip6] [disable]               */
 /* ------------------------------------------------------------------ */
 
 static clib_error_t *
@@ -142,6 +192,8 @@ gpu_classify_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
   unformat_input_t     _line_input, *line_input = &_line_input;
   u32		       sw_if_index = ~0;
   u8		       enable	   = 1;
+  u8		       do_ip4	   = 0;
+  u8		       do_ip6	   = 0;
   clib_error_t	      *error	   = 0;
 
   if (!unformat_user (input, unformat_line_input, line_input))
@@ -154,6 +206,10 @@ gpu_classify_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	;
       else if (unformat (line_input, "disable"))
 	enable = 0;
+      else if (unformat (line_input, "ip4"))
+	do_ip4 = 1;
+      else if (unformat (line_input, "ip6"))
+	do_ip6 = 1;
       else
 	{
 	  error = clib_error_return (0, "unknown input: `%U'",
@@ -161,6 +217,10 @@ gpu_classify_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	  goto done;
 	}
     }
+
+  /* If neither ip4 nor ip6 specified, affect both. */
+  if (!do_ip4 && !do_ip6)
+    do_ip4 = do_ip6 = 1;
 
   if (sw_if_index == ~0)
     {
@@ -178,14 +238,26 @@ gpu_classify_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
   vec_validate_init_empty (gcm->if_state, sw_if_index,
 			   (gpu_classify_if_state_t){ 0 });
-  gcm->if_state[sw_if_index].ip4_enabled = enable;
 
-  vnet_feature_enable_disable ("ip4-unicast", "gpu-classify-ip4",
-				sw_if_index, enable, 0, 0);
+  if (do_ip4)
+    {
+      gcm->if_state[sw_if_index].ip4_enabled = enable;
+      vnet_feature_enable_disable ("ip4-unicast", "gpu-classify-ip4",
+				   sw_if_index, enable, 0, 0);
+    }
+  if (do_ip6)
+    {
+      gcm->if_state[sw_if_index].ip6_enabled = enable;
+      vnet_feature_enable_disable ("ip6-unicast", "gpu-classify-ip6",
+				   sw_if_index, enable, 0, 0);
+    }
 
-  vlib_cli_output (vm, "gpu-classify %s on %U (ip4-unicast)",
-		   enable ? "enabled" : "disabled", format_vnet_sw_if_index_name,
-		   gcm->vnet_main, sw_if_index);
+  vlib_cli_output (vm, "gpu-classify %s on %U (%s%s%s)",
+		   enable ? "enabled" : "disabled",
+		   format_vnet_sw_if_index_name, gcm->vnet_main, sw_if_index,
+		   do_ip4 ? "ip4" : "",
+		   (do_ip4 && do_ip6) ? "+" : "",
+		   do_ip6 ? "ip6" : "");
 done:
   unformat_free (line_input);
   return error;
@@ -193,7 +265,7 @@ done:
 
 VLIB_CLI_COMMAND (gpu_classify_enable_command, static) = {
   .path	      = "gpu-classify enable",
-  .short_help = "gpu-classify enable <interface> [disable]",
+  .short_help = "gpu-classify enable <interface> [ip4] [ip6] [disable]",
   .function   = gpu_classify_enable_command_fn,
 };
 
@@ -247,27 +319,57 @@ gpu_classify_rule_command_fn (vlib_main_t *vm, unformat_input_t *input,
   gpu_classify_rule_t rule;
   clib_memset (&rule, 0, sizeof (rule));
 
-  ip4_address_t addr;
+  ip4_address_t addr4;
+  ip6_address_t addr6;
   u32	       prefix_len;
   u32	       val32, val32b;
-  u8	       action_set = 0;
+  u8	       action_set  = 0;
+  u8	       src_ip_ver  = 0;
+  u8	       dst_ip_ver  = 0;
 
   while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
     {
       if (unformat (line_input, "proto %d", &val32))
 	rule.proto = (u8) val32;
-      else if (unformat (line_input, "src %U/%d", unformat_ip4_address, &addr,
-			 &prefix_len))
+
+      /* ---- Source address: try IPv4 first, then IPv6 -------------- */
+      else if (unformat (line_input, "src %U/%d", unformat_ip4_address,
+			 &addr4, &prefix_len))
 	{
-	  rule.src_addr = addr.as_u32;
-	  rule.src_mask = prefixlen_to_mask (prefix_len);
+	  clib_memset (rule.src_addr, 0, 16);
+	  clib_memcpy (rule.src_addr, &addr4.as_u32, 4);
+	  clib_memset (rule.src_mask, 0, 16);
+	  u32 mask4 = prefixlen_to_mask (prefix_len);
+	  clib_memcpy (rule.src_mask, &mask4, 4);
+	  src_ip_ver = 4;
 	}
-      else if (unformat (line_input, "dst %U/%d", unformat_ip4_address, &addr,
-			 &prefix_len))
+      else if (unformat (line_input, "src %U/%d", unformat_ip6_address,
+			 &addr6, &prefix_len))
 	{
-	  rule.dst_addr = addr.as_u32;
-	  rule.dst_mask = prefixlen_to_mask (prefix_len);
+	  clib_memcpy (rule.src_addr, addr6.as_u8, 16);
+	  prefixlen6_to_mask (prefix_len, rule.src_mask);
+	  src_ip_ver = 6;
 	}
+
+      /* ---- Destination address: try IPv4 first, then IPv6 --------- */
+      else if (unformat (line_input, "dst %U/%d", unformat_ip4_address,
+			 &addr4, &prefix_len))
+	{
+	  clib_memset (rule.dst_addr, 0, 16);
+	  clib_memcpy (rule.dst_addr, &addr4.as_u32, 4);
+	  clib_memset (rule.dst_mask, 0, 16);
+	  u32 mask4 = prefixlen_to_mask (prefix_len);
+	  clib_memcpy (rule.dst_mask, &mask4, 4);
+	  dst_ip_ver = 4;
+	}
+      else if (unformat (line_input, "dst %U/%d", unformat_ip6_address,
+			 &addr6, &prefix_len))
+	{
+	  clib_memcpy (rule.dst_addr, addr6.as_u8, 16);
+	  prefixlen6_to_mask (prefix_len, rule.dst_mask);
+	  dst_ip_ver = 6;
+	}
+
       else if (unformat (line_input, "sport %d", &val32))
 	rule.src_port = clib_host_to_net_u16 ((u16) val32);
       else if (unformat (line_input, "dport %d", &val32))
@@ -299,6 +401,17 @@ gpu_classify_rule_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	  goto done;
 	}
     }
+
+  /* Validate: cannot mix IPv4 src with IPv6 dst (or vice versa). */
+  if (src_ip_ver && dst_ip_ver && src_ip_ver != dst_ip_ver)
+    {
+      error = clib_error_return (
+	0, "cannot mix IPv4 src with IPv6 dst (or vice versa)");
+      goto done;
+    }
+
+  /* ip_version = 0 means "any version" (no address constraints). */
+  rule.ip_version = src_ip_ver ? src_ip_ver : dst_ip_ver;
 
   if (!action_set)
     {
@@ -415,16 +528,21 @@ gpu_classify_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
 		       p50, p99, p999);
     }
 
-  /* Print per-interface enable state */
+  /* ---- Per-interface enable state ---- */
   vlib_cli_output (vm, "\nEnabled interfaces:");
   for (u32 i = 0; i < vec_len (gcm->if_state); i++)
     {
-      if (gcm->if_state[i].ip4_enabled)
-	vlib_cli_output (vm, "  %U (ip4)",
-			 format_vnet_sw_if_index_name, gcm->vnet_main, i);
+      u8 v4 = gcm->if_state[i].ip4_enabled;
+      u8 v6 = gcm->if_state[i].ip6_enabled;
+      if (v4 || v6)
+	vlib_cli_output (vm, "  %U (%s%s%s)",
+			 format_vnet_sw_if_index_name, gcm->vnet_main, i,
+			 v4 ? "ip4" : "",
+			 (v4 && v6) ? "+" : "",
+			 v6 ? "ip6" : "");
     }
 
-  /* Print rules */
+  /* ---- Rules ---- */
   vlib_cli_output (vm, "\nRules:");
   for (u32 i = 0; i < gcm->n_rules; i++)
     {
@@ -432,22 +550,32 @@ gpu_classify_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
       const char *act =
 	(r->action < 3) ? action_names[r->action] : "?";
 
-      vlib_cli_output (
-	vm,
-	"  [%2d] proto=%-3d  src=%U/%d  dst=%U/%d  "
-	"sport=%-5d dport=%-5d  tcpflags=%02x/%02x  action=%s",
-	i, r->proto, format_ip4_address, &r->src_addr,
-	/* mask → prefix length: /24 host-order = 0xFFFFFF00, ctz = 8, 32-8 = 24 */
-	(r->src_mask == 0) ?
-	  0 :
-	  32 - __builtin_ctz (clib_net_to_host_u32 (r->src_mask)),
-	format_ip4_address, &r->dst_addr,
-	(r->dst_mask == 0) ?
-	  0 :
-	  32 - __builtin_ctz (clib_net_to_host_u32 (r->dst_mask)),
-	clib_net_to_host_u16 (r->src_port),
-	clib_net_to_host_u16 (r->dst_port), r->tcp_flags_mask,
-	r->tcp_flags_val, act);
+      if (r->ip_version == 6)
+	vlib_cli_output (
+	  vm,
+	  "  [%2d] v6  proto=%-3d  src=%U/%d  dst=%U/%d  "
+	  "sport=%-5d dport=%-5d  tcpflags=%02x/%02x  action=%s",
+	  i, r->proto,
+	  format_ip6_address, (ip6_address_t *) r->src_addr,
+	  mask_to_plen (r->src_mask, 16),
+	  format_ip6_address, (ip6_address_t *) r->dst_addr,
+	  mask_to_plen (r->dst_mask, 16),
+	  clib_net_to_host_u16 (r->src_port),
+	  clib_net_to_host_u16 (r->dst_port),
+	  r->tcp_flags_mask, r->tcp_flags_val, act);
+      else
+	vlib_cli_output (
+	  vm,
+	  "  [%2d] v%d  proto=%-3d  src=%U/%d  dst=%U/%d  "
+	  "sport=%-5d dport=%-5d  tcpflags=%02x/%02x  action=%s",
+	  i, r->ip_version, r->proto,
+	  format_ip4_address, (ip4_address_t *) r->src_addr,
+	  mask_to_plen (r->src_mask, 4),
+	  format_ip4_address, (ip4_address_t *) r->dst_addr,
+	  mask_to_plen (r->dst_mask, 4),
+	  clib_net_to_host_u16 (r->src_port),
+	  clib_net_to_host_u16 (r->dst_port),
+	  r->tcp_flags_mask, r->tcp_flags_val, act);
     }
 
   return 0;

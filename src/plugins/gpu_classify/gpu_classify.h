@@ -35,6 +35,7 @@
 typedef struct
 {
   u8 ip4_enabled; /**< Non-zero when the ip4-unicast feature is active */
+  u8 ip6_enabled; /**< Non-zero when the ip6-unicast feature is active */
 } gpu_classify_if_state_t;
 
 /* ------------------------------------------------------------------ */

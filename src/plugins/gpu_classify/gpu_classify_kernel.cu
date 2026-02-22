@@ -13,7 +13,7 @@
  *  Constant memory (64 KB, broadcast):
  *    All 32 threads in a warp read the same rule in the same cycle via
  *    a single broadcast — no bank conflicts, effectively "free" reads.
- *    64 rules × 24 bytes = 1 536 bytes consumed.
+ *    64 rules × 80 bytes = 5 120 bytes consumed.
  *
  *  One thread per packet:
  *    Block = 256 threads (== VLIB_FRAME_SIZE).  Grid = 1 block per call.
@@ -38,6 +38,37 @@
  *  via cudaMemcpyToSymbol; read every invocation by every thread.    */
 __constant__ gpu_classify_rule_t d_rules[GPU_CLASSIFY_MAX_RULES];
 __constant__ int		 d_n_rules;
+
+/* ================================================================== */
+/* Device-side helpers                                                 */
+/* ================================================================== */
+
+/**
+ * @brief Test whether a 16-byte IP address matches a prefix.
+ *
+ * Performs four 32-bit masked comparisons covering the full 128-bit
+ * address.  When mask words are zero the corresponding comparison is
+ * always true, so a fully-zero mask unconditionally matches (wildcard).
+ *
+ * Both IPv4 and IPv6 use this helper:
+ *  - IPv4: only bytes 0–3 are non-zero; bytes 4–15 of mask and addr
+ *    are 0, so the upper comparisons are always true.
+ *  - IPv6: all 16 bytes participate.
+ *
+ * @param pkt   16-byte packet address (must be 4-byte aligned).
+ * @param addr  16-byte rule address   (must be 4-byte aligned).
+ * @param mask  16-byte prefix mask    (must be 4-byte aligned).
+ * @return      1 if (pkt & mask) == addr, 0 otherwise.
+ */
+__device__ __forceinline__ static int
+ip_matches (const uint8_t *pkt, const uint8_t *addr, const uint8_t *mask)
+{
+  const uint32_t *p = (const uint32_t *) pkt;
+  const uint32_t *a = (const uint32_t *) addr;
+  const uint32_t *m = (const uint32_t *) mask;
+  return ((p[0] & m[0]) == a[0]) & ((p[1] & m[1]) == a[1]) &
+	 ((p[2] & m[2]) == a[2]) & ((p[3] & m[3]) == a[3]);
+}
 
 /* ================================================================== */
 /* Kernel                                                              */
@@ -89,12 +120,16 @@ gpu_classify_kernel (const gpu_pkt_desc_t *__restrict__ descs,
       if (r->proto != 0 && r->proto != d->ip_proto)
 	continue;
 
+      /* ---- IP version ---------------------------------------------- */
+      if (r->ip_version != 0 && r->ip_version != d->ip_version)
+	continue;
+
       /* ---- Source IP prefix ---------------------------------------- */
-      if (r->src_mask != 0 && (d->src_ip4 & r->src_mask) != r->src_addr)
+      if (!ip_matches (d->src_ip, r->src_addr, r->src_mask))
 	continue;
 
       /* ---- Destination IP prefix ------------------------------------ */
-      if (r->dst_mask != 0 && (d->dst_ip4 & r->dst_mask) != r->dst_addr)
+      if (!ip_matches (d->dst_ip, r->dst_addr, r->dst_mask))
 	continue;
 
       /* ---- Source port --------------------------------------------- */
@@ -117,10 +152,6 @@ gpu_classify_kernel (const gpu_pkt_desc_t *__restrict__ descs,
 
   results[tid] = action;
 }
-
-/* ================================================================== */
-/* C-callable host wrappers                                           */
-/* ================================================================== */
 
 /* ================================================================== */
 /* Host-side helpers                                                   */
