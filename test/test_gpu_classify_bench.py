@@ -513,6 +513,108 @@ class TestGpuClassifyBench(VppTestCase):
             "   GPU μs/fr − kern μs = VPP feature-arc + buffer overhead)"
         )
 
+    # ------------------------------------------------------------------
+    # ACL diagnostics
+    # ------------------------------------------------------------------
+
+    def _acl_show_interface(self):
+        """Print 'show acl-plugin interface' to confirm ACL is visible to VPP."""
+        out = self.vapi.cli("show acl-plugin interface")
+        print("  [show acl-plugin interface]")
+        for line in out.splitlines():
+            if line.strip():
+                print(f"    {line.rstrip()}")
+
+
+    # ==================================================================
+    # Benchmark 0a — baseline (no GPU, no ACL — pure VPP forwarding)
+    # ==================================================================
+
+    def test_bench_00a_baseline(self):
+        """Baseline: pure VPP forwarding with NO feature enabled.
+
+        This gives the floor: the unavoidable overhead from pg → ip4-input →
+        ip4-unicast arc → ip4-lookup → pg-output.  All other scenarios add
+        their feature overhead on top of this baseline.
+
+        If the ACL 'no-match' result is indistinguishable from this baseline,
+        it means either the ACL adds sub-microsecond overhead (O(1) hash table)
+        or the ACL is not applied.  The functional test (test_bench_00b_*) below
+        confirms which case it is.
+        """
+        pkts = self._pkts(self.PASS_PORT)
+        n_total_k = self.BATCH * self.N_REPS // 1000
+        w = 88
+        print(f"\n{'=' * w}")
+        print(
+            f"  Baseline — pure VPP forwarding (no GPU, no ACL)\n"
+            f"  {self.BATCH}-pkt frames, {self.N_REPS} reps = {n_total_k}k pkts"
+        )
+        print("=" * w)
+        mpps, us = self._time_pg(pkts)
+        print(f"  Baseline: {mpps:.3f} Mpps  {us:.1f} µs/frame")
+        print(
+            "  (All other scenarios should show HIGHER µs/frame than this baseline;\n"
+            "   if ACL µs/frame ≈ baseline, ACL adds negligible overhead.)"
+        )
+
+    # ==================================================================
+    # Benchmark 0b — ACL functional validation
+    # ==================================================================
+
+    def test_bench_00b_acl_functional(self):
+        """Functional validation: confirm ACL actually drops/permits traffic.
+
+        Installs one deny rule (DENY_PORT_BASE) + permit-all fallthrough.
+        Sends one packet to each port and verifies correct forwarding/dropping.
+        This test FAILS if the ACL is not being applied to the interface.
+        """
+        if not self.acl_available:
+            self.skipTest("ACL plugin not available")
+
+        w = 88
+        print(f"\n{'=' * w}")
+        print("  ACL functional validation — verify ACL is actually applied")
+        print("=" * w)
+
+        deny_port = self.DENY_PORT_BASE
+        pass_port = self.PASS_PORT
+
+        pkt_deny = (
+            Ether(dst=self.pg0.local_mac, src=self.pg0.remote_mac)
+            / IP(src=self.pg0.remote_ip4, dst=self.pg1.remote_ip4)
+            / TCP(sport=12345, dport=deny_port)
+        )
+        pkt_pass = (
+            Ether(dst=self.pg0.local_mac, src=self.pg0.remote_mac)
+            / IP(src=self.pg0.remote_ip4, dst=self.pg1.remote_ip4)
+            / TCP(sport=12345, dport=pass_port)
+        )
+
+        rules = [self._acl_deny(deny_port), AclRule(is_permit=1)]
+        self._acl_install(rules)
+        self._acl_show_interface()
+
+        # ---- Send a deny-matched packet: expect pg1 receives nothing ----
+        self.pg1.enable_capture()
+        self.pg0.add_stream([pkt_deny])
+        self.pg_start()
+        self.pg1.assert_nothing_captured(
+            remark=f"ACL deny rule should have dropped TCP dport={deny_port}"
+        )
+        print(f"  PASS: deny packet (dport={deny_port}) was dropped by ACL")
+
+        # ---- Send a pass-through packet: expect pg1 receives it ----
+        self.pg1.enable_capture()
+        self.pg0.add_stream([pkt_pass])
+        self.pg_start()
+        rx = self.pg1.get_capture(1)
+        self.assertEqual(len(rx), 1)
+        print(f"  PASS: pass packet (dport={pass_port}) was forwarded by ACL")
+
+        self._acl_remove()
+        print("\n  ACL functional validation PASSED — ACL is correctly applied.")
+
     # ==================================================================
     # Benchmark 1 — no-match (worst-case linear scan for all rules)
     # ==================================================================
@@ -531,6 +633,7 @@ class TestGpuClassifyBench(VppTestCase):
             f"{self.N_REPS} reps = {n_total_k}k pkts per measurement)"
         )
 
+        first_acl_run = True
         for n in self.RULE_COUNTS:
             gpu_mpps = gpu_us = kern_us = acl_mpps = acl_us = None
 
@@ -552,6 +655,9 @@ class TestGpuClassifyBench(VppTestCase):
                     + [AclRule(is_permit=1)]   # permit-all fallthrough
                 )
                 self._acl_install(rules)
+                if first_acl_run:
+                    self._acl_show_interface()
+                    first_acl_run = False
                 acl_mpps, acl_us = self._time_pg(pkts)
                 self._acl_remove()
 

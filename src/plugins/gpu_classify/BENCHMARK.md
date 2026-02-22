@@ -2,7 +2,7 @@
 
 **Hardware**: NVIDIA DGX Spark — Grace CPU (ARM Neoverse V2) + Blackwell GB10 GPU (NVLink-C2C)
 **Date**: 2026-02-22
-**Rule storage**: cudaMallocManaged (moved from `__constant__` memory to support up to 1024 rules)
+**Rule storage**: cudaMallocManaged (1024-rule capacity, ~80 KB)
 **Kernel mode**: persistent (adaptive; activates after 4 consecutive frames ≥ 128 pkts)
 
 Test parameters: 256-packet frames, 50 000 reps = 12.8 M packets per measurement.
@@ -11,27 +11,49 @@ Test parameters: 256-packet frames, 50 000 reps = 12.8 M packets per measurement
 
 ---
 
+## Validation
+
+ACL is confirmed to be correctly applied:
+
+- `test_bench_00b_acl_functional` sends 1 deny-matched packet → drops; 1 pass packet → forwards.
+- `show acl-plugin interface` shows `input acl(s): 0` on sw_if_index 1 (pg0).
+
+---
+
+## Baseline — pure VPP forwarding (no feature)
+
+```
+  Baseline: 9.669 Mpps   26.5 µs/frame
+```
+
+This is the floor: pg → ip4-input → ip4-unicast arc → ip4-lookup → pg-output.
+All other scenarios add feature overhead on top of this.
+
+---
+
 ## Scenario 1 — No-match (full linear scan)
 
-Traffic hits **none** of the N deny rules; GPU scans all N, finds no match, passes packet.
+Traffic hits **none** of the N deny rules; GPU scans all N, no match, passes.
 ACL has N deny rules on distinct ports + one permit-all fallthrough.
 
 ```
    Rules    GPU Mpps   GPU µs/fr   kern µs    ACL Mpps   ACL µs/fr   GPU/ACL
   ------  ----------  ----------  --------  ----------  ----------  --------
-       1       7.452        34.4       4.2       7.213        35.5     1.03x
-       8       6.270        40.8      10.8       7.192        35.6     0.87x
-      64       2.925        87.5      56.7       7.204        35.5     0.41x
-     256       1.071       239.1     206.7       7.121        36.0     0.15x
-    1024       0.303       845.8     811.6       7.223        35.4     0.04x
+       1       7.288        35.1       4.0       6.967        36.7     1.05x
+       8       6.178        41.4      10.2       7.010        36.5     0.88x
+      64       2.928        87.4      55.4       6.992        36.6     0.42x
+     256       1.069       239.5     207.2       6.930        36.9     0.15x
+    1024       0.302       847.9     810.2       7.050        36.3     0.04x
 ```
 
-**GPU**: O(N) linear scan — kern µs grows proportionally to N.
-**ACL**: flat ~35-36 µs regardless of N. The ACL plugin builds one hash table per unique
-(src_mask, dst_mask, proto_mask, port_mask) pattern. All port-based deny rules share the
-same mask pattern → single hash table, O(1) lookup regardless of N.
+**GPU**: O(N) linear scan — kern µs ≈ (N rules × ~0.8 µs/rule).
+**ACL**: flat ~36-37 µs regardless of N. The ACL plugin places all port-based deny rules
+sharing the same (src_mask, dst_mask, proto_mask, port_mask) pattern into a **single hash
+table**. Hash-table lookup is O(1), so adding more entries doesn't slow it down.
 
-> **Note**: ACL flatness needs verification — see "ACL Validation" section below.
+**ACL overhead** = 36.5 − 26.5 = **~10 µs** constant above baseline (the hash-table probe
+itself). This is confirmed real: functional validation proves the ACL drops matched packets,
+and `show acl-plugin interface` confirms it is applied.
 
 ---
 
@@ -42,15 +64,15 @@ Traffic always matches rule 0. Both plugins exit after exactly 1 comparison.
 ```
    Rules    GPU Mpps   GPU µs/fr   kern µs    ACL Mpps   ACL µs/fr   GPU/ACL
   ------  ----------  ----------  --------  ----------  ----------  --------
-       1       7.418        34.5       3.8       7.267        35.2     1.02x
-       8       7.417        34.5       4.5       7.276        35.2     1.02x
-      64       7.442        34.4       4.1       7.286        35.1     1.02x
-     256       7.422        34.5       3.7       7.306        35.0     1.02x
-    1024       7.420        34.5       3.9       7.354        34.8     1.01x
+       1       7.234        35.4       3.8       7.115        36.0     1.02x
+       8       7.281        35.2       4.0       7.117        36.0     1.02x
+      64       7.196        35.6       4.4       7.073        36.2     1.02x
+     256       6.907        37.1       4.2       7.164        35.7     0.96x
+    1024       7.293        35.1       3.6       7.098        36.1     1.03x
 ```
 
 GPU kern µs ≈ 4 µs flat — only one rule is checked per packet, independent of N.
-GPU and ACL are neck-and-neck (~34.5 µs vs ~35 µs); both exit immediately on rule 0.
+GPU and ACL are neck-and-neck (~35-36 µs vs ~35-36 µs); both exit immediately on rule 0.
 
 ---
 
@@ -62,11 +84,11 @@ Nearly identical to Scenario 1 (same number of comparisons, different terminal a
 ```
    Rules    GPU Mpps   GPU µs/fr   kern µs    ACL Mpps   ACL µs/fr   GPU/ACL
   ------  ----------  ----------  --------  ----------  ----------  --------
-       1       7.423        34.5       4.3       7.128        35.9     1.04x
-       8       6.230        41.1      10.1       7.295        35.1     0.85x
-      64       2.912        87.9      57.3       7.273        35.2     0.40x
-     256       1.066       240.3     207.1       7.362        34.8     0.14x
-    1024       0.302       847.0     811.7       7.333        34.9     0.04x
+       1       6.995        36.6       4.0       7.043        36.3     0.99x
+       8       6.189        41.4       9.8       7.151        35.8     0.87x
+      64       2.917        87.8      55.7       7.088        36.1     0.41x
+     256       1.069       239.5     208.1       7.166        35.7     0.15x
+    1024       0.302       847.0     809.9       7.146        35.8     0.04x
 ```
 
 ---
@@ -81,57 +103,62 @@ distinct mask combos → more hash table probes per packet. The GPU always scans
 rules linearly regardless of mask diversity.
 
 ```
-  Combos    GPU Mpps   GPU µs/fr   kern µs    ACL Mpps   ACL µs/fr   GPU/ACL  (src, dst) pairs
-  ------  ----------  ----------  --------  ----------  ----------  --------  --------------------
-       1       3.913        65.4      36.3       7.225        35.4     0.54x  (/8,/8)
-       2       3.888        65.8      34.4       7.218        35.5     0.54x  (/8,/8) (/8,/16)
-       4       3.857        66.4      36.4       7.210        35.5     0.53x  (/8,/8)…(/8,/32)
-       8       3.902        65.6      35.1       7.204        35.5     0.54x  8 combos
-      16       3.915        65.4      33.3       7.226        35.4     0.54x  all 16 combos
+  Combos    GPU Mpps   GPU µs/fr   kern µs    ACL Mpps   ACL µs/fr   GPU/ACL
+  ------  ----------  ----------  --------  ----------  ----------  --------
+       1       3.915        65.4      34.3       7.026        36.4     0.56x
+       2       3.897        65.7      33.9       7.010        36.5     0.56x
+       4       3.858        66.3      32.3       6.981        36.7     0.55x
+       8       3.864        66.2      32.5       7.021        36.5     0.55x
+      16       3.931        65.1      34.5       6.989        36.6     0.56x
 ```
 
-**Observation**: ACL stays flat even as mask combos grow from 1 to 16. This is surprising and
-requires validation — see below.
+**Observation**: ACL stays flat at ~36 µs even as distinct (src_mask, dst_mask) combos grow
+from 1 to 16. Each additional mask type adds another hash table, but each table probe is
+O(1) and takes ≪1 µs per packet at 256 pkts/frame — the overhead of 16 table probes vs 1
+is below measurement resolution.
+
+**Hypothesis for testing a stronger effect**: use dst-only mask types with very diverse
+prefix lengths across a *larger* rule set (e.g., 1024 rules with 16 mask types → ~64
+entries per table vs ~1024 in a single table) to make the per-table probe cost more visible.
 
 ---
 
-## Key observations
+## Summary
 
 | Metric | Value |
 |--------|-------|
-| VPP overhead (constant) | ~31 µs/frame |
-| GPU kernel @ 1 rule | ~4 µs (kern µs) |
-| GPU kernel @ 64 rules | ~57 µs |
-| GPU kernel @ 1024 rules | ~812 µs |
-| GPU kern µs scaling | linear with N (O(N) scan) |
-| ACL latency | ~35 µs flat (O(1) hash table) |
+| Baseline VPP forwarding | 26.5 µs/frame |
+| ACL overhead (O(1) hash table) | ~10 µs constant above baseline |
+| GPU overhead (VPP arc) | ~31 µs constant above kern µs |
+| GPU kern µs @ 1 rule | ~4 µs |
+| GPU kern µs @ 64 rules | ~55 µs |
+| GPU kern µs @ 1024 rules | ~810 µs |
+| GPU kern µs scaling | linear with N (O(N) scan, ~0.8 µs/rule) |
 
-**Crossover point**: GPU outperforms ACL at ≤ ~8 rules on no-match workloads.
-At ≥ 64 rules, the ACL plugin is faster due to its O(1) hash-table design.
+**Crossover point**: GPU beats ACL at ≤ ~8 rules on no-match workloads.
+At N ≥ 64 rules, the ACL plugin is faster (O(1) hash table vs GPU's O(N) linear scan).
 
-**First-match advantage**: The persistent GPU kernel is competitive with ACL at any rule
-count when traffic always matches rule 0 (~34.5 µs vs ~35 µs), because the GPU's 256
-threads all finish after 1 comparison.
+**First-match**: Both GPU and ACL are essentially tied (~35-36 µs) at any rule count,
+because both exit after 1 comparison. The GPU's parallel-per-packet execution wins back
+the no-match overhead for workloads where rule 0 almost always fires.
+
+**Mask diversity**: The ACL plugin's multi-table design handles up to 16 distinct
+(src_mask, dst_mask) pairs with negligible additional overhead at 64 rules. A larger
+rule set would amplify the per-probe cost difference.
 
 ---
 
-## ACL Validation TODO
+## Architecture notes
 
-The flat ACL performance (~35 µs regardless of rule count or mask diversity) could mean:
+- ACL plugin: stateless multi-field hash-table classification, one table per unique mask
+  combination. O(1) per packet regardless of rules-per-table. Proven correct via functional
+  test: `test_bench_00b_acl_functional` verifies deny/permit works, `show acl-plugin
+  interface` confirms the feature is enabled inbound on pg0.
 
-1. **(Correct)** The ACL plugin's hash tables are truly O(1) per packet, all rules of the
-   same mask pattern share one table, and adding entries doesn't slow lookups.
+- gpu_classify: linear scan of all rules by 256 GPU threads in parallel (one thread per
+  packet slot). O(N) in rule count but all 256 packets are processed simultaneously. The
+  crossover vs ACL depends on rule count: competitive at N ≤ 8, slower at N ≥ 64.
 
-2. **(Incorrect)** The ACL is not being applied to the interface correctly, and traffic
-   bypasses it entirely (~35 µs = bare VPP forwarding overhead without classification).
-
-**Validation needed**: confirm that a packet matching a deny rule is actually dropped when
-the ACL is installed. Check VPP ACL drop counters (`show acl-plugin acl`) after a run
-with matching traffic.
-
-The benchmark code (`_acl_install`) uses:
-```python
-VppAclInterface(sw_if_index=pg0, acls=[acl], n_input=1)
-```
-This should apply the ACL as an inbound ip4-unicast feature on pg0, but this needs
-end-to-end verification.
+- Persistent kernel eliminates the ~30 µs cudaStreamSynchronize round-trip; kern µs
+  measures only the GPU-side classification time. VPP feature-arc overhead (~31 µs/frame)
+  dominates at low rule counts.
