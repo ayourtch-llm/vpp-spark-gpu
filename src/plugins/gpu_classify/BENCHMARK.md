@@ -93,33 +93,42 @@ Nearly identical to Scenario 1 (same number of comparisons, different terminal a
 
 ---
 
-## Scenario 4 — Diverse src+dst prefix mask combinations (64 rules)
+## Scenario 4 — Diverse dst prefix lengths (1024 rules)
 
-Fixed N=64 rules, varying number of distinct (src_mask, dst_mask) pairs from 1 to 16.
-Traffic matches none. Tests whether mask diversity affects ACL vs GPU differently.
+Fixed N=1024 dst-only prefix rules, varying number of distinct dst prefix lengths from 1
+to 21.  Traffic matches none.  Each distinct prefix length creates one ACL hash table.
 
-The ACL plugin builds one hash table per unique (src_mask, dst_mask) pair, so more
-distinct mask combos → more hash table probes per packet. The GPU always scans all 64
-rules linearly regardless of mask diversity.
+Rule addresses: generated as `(global_idx << (32-plen))` in 0.0.0.0–63.255.255.255 space
+(safely away from 172.16.x.x test traffic). COMBO_LENGTHS = [/32, /31, …, /12].
 
 ```
-  Combos    GPU Mpps   GPU µs/fr   kern µs    ACL Mpps   ACL µs/fr   GPU/ACL
+  Tables    GPU Mpps   GPU µs/fr   kern µs    ACL Mpps   ACL µs/fr   GPU/ACL  dst lengths
   ------  ----------  ----------  --------  ----------  ----------  --------
-       1       3.915        65.4      34.3       7.026        36.4     0.56x
-       2       3.897        65.7      33.9       7.010        36.5     0.56x
-       4       3.858        66.3      32.3       6.981        36.7     0.55x
-       8       3.864        66.2      32.5       7.021        36.5     0.55x
-      16       3.931        65.1      34.5       6.989        36.6     0.56x
+       1       0.355       720.3     685.3       7.005        36.5     0.05x   /32
+       2       0.354       723.5     688.5       6.982        36.7     0.05x   /32 /31
+       4       0.353       724.3     689.6       6.991        36.6     0.05x   /32…/29
+       8       0.354       723.5     689.0       6.519        39.3     0.05x   /32…/25
+      16       0.353       725.2     689.1       5.109        50.1     0.07x   /32…/17
+      21       0.358       714.7     676.3       4.560        56.1     0.08x   /32…/12
 ```
 
-**Observation**: ACL stays flat at ~36 µs even as distinct (src_mask, dst_mask) combos grow
-from 1 to 16. Each additional mask type adds another hash table, but each table probe is
-O(1) and takes ≪1 µs per packet at 256 pkts/frame — the overhead of 16 table probes vs 1
-is below measurement resolution.
+**GPU**: flat ~720–725 µs/frame (always scans all 1024 rules, O(N)); kern µs ≈ 685–690
+µs for 1024 rules, matching Scenario 1 no-match at 1024 rules.
 
-**Hypothesis for testing a stronger effect**: use dst-only mask types with very diverse
-prefix lengths across a *larger* rule set (e.g., 1024 rules with 16 mask types → ~64
-entries per table vs ~1024 in a single table) to make the per-table probe cost more visible.
+**ACL multi-table probe overhead**:
+- K=1..4: ACL flat at ~36-37 µs — probe overhead too small to measure
+- K=8: ACL rises to 39.3 µs (+2.8 µs above K=1, +8%)
+- K=16: ACL 50.1 µs (+13.6 µs, +37%)
+- K=21: ACL 56.1 µs (+19.6 µs, +54%)
+
+**Observation**: The ACL IS doing K hash-table probes per packet, but the overhead only
+becomes measurable at K ≥ 8 (with 128+ rules per table causing cache pressure). With 64
+rules and K=1..16 (old Scenario 4), table sizes were too small (4 rules/table) for the
+per-probe overhead to register. With 1024 rules, the larger tables create enough cache
+pressure to make K-probe scaling visible.
+
+**Per-probe cost**: approximately 0.9–1.3 µs per frame of 256 packets (~3.5–5 ns/pkt/probe),
+rising slightly as more tables compete for L2 cache.
 
 ---
 
@@ -142,18 +151,22 @@ At N ≥ 64 rules, the ACL plugin is faster (O(1) hash table vs GPU's O(N) linea
 because both exit after 1 comparison. The GPU's parallel-per-packet execution wins back
 the no-match overhead for workloads where rule 0 almost always fires.
 
-**Mask diversity**: The ACL plugin's multi-table design handles up to 16 distinct
-(src_mask, dst_mask) pairs with negligible additional overhead at 64 rules. A larger
-rule set would amplify the per-probe cost difference.
+**Mask diversity**: The ACL plugin's multi-table design has measurable per-probe overhead
+at K ≥ 8 distinct prefix lengths with 1024 rules. Each distinct dst prefix length creates
+one hash table; K tables → K probes per packet at ~1–1.3 µs/frame (3.5–5 ns/pkt/probe).
+At K=21, ACL costs 56 µs/frame (+54% vs K=1). At 64 rules with K=1..16 the overhead is
+below measurement noise (tables too small to cause cache pressure).
 
 ---
 
 ## Architecture notes
 
 - ACL plugin: stateless multi-field hash-table classification, one table per unique mask
-  combination. O(1) per packet regardless of rules-per-table. Proven correct via functional
-  test: `test_bench_00b_acl_functional` verifies deny/permit works, `show acl-plugin
-  interface` confirms the feature is enabled inbound on pg0.
+  combination. O(1) per packet per table; K distinct mask types → K probes per packet.
+  Proven correct via functional test: `test_bench_00b_acl_functional` verifies deny/permit
+  works, `show acl-plugin interface` confirms the feature is enabled inbound on pg0.
+  Multi-probe overhead: ~1–1.3 µs/frame per additional probe (measurable at K ≥ 8 with
+  1024 rules; below noise at K ≤ 16 with only 64 rules).
 
 - gpu_classify: linear scan of all rules by 256 GPU threads in parallel (one thread per
   packet slot). O(N) in rule count but all 256 packets are processed simultaneously. The
