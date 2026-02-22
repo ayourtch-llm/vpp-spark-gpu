@@ -17,9 +17,12 @@
 /* Constants                                                           */
 /* ------------------------------------------------------------------ */
 
-/** Maximum number of classification rules held in GPU constant memory.
- *  64 rules × 80 bytes = 5 120 bytes (well within the 64 KB limit).  */
-#define GPU_CLASSIFY_MAX_RULES  64
+/** Maximum number of classification rules.
+ *  Stored in cudaMallocManaged memory (not constant memory) so the limit
+ *  is GPU global-memory capacity rather than the 64 KB constant cache.
+ *  1024 rules × 80 bytes = 81 920 bytes (≈ 80 KB), comfortably cached in
+ *  the Blackwell L2 (128 MB).  Raise freely as needed.               */
+#define GPU_CLASSIFY_MAX_RULES  1024
 
 /** Maximum packets per VPP frame (== VLIB_FRAME_SIZE).               */
 #define GPU_CLASSIFY_MAX_FRAME  256
@@ -77,7 +80,7 @@ typedef struct
 /* ------------------------------------------------------------------ */
 
 /**
- * @brief One classification rule stored in GPU constant memory.
+ * @brief One classification rule stored in cudaMallocManaged memory.
  *
  * Field semantics:
  *  - ip_version: 4, 6, or 0 (0 = match any IP version).
@@ -147,8 +150,9 @@ typedef struct
    * volatile) uint32_t so cuda::atomic_ref can bind without a cast.  */
   uint32_t submit_seq;           /**< Incremented per batch by the CPU      */
   volatile int32_t  n_packets;   /**< Packet count for this batch           */
+  volatile int32_t  n_rules;     /**< Active rule count (updated by CPU)    */
   volatile uint32_t kill;        /**< Set to 1 to terminate the kernel      */
-  uint8_t _cpu_pad[128 - 12];    /**< Pad to exactly 128 bytes              */
+  uint8_t _cpu_pad[128 - 16];    /**< Pad to exactly 128 bytes              */
 
   /* ---- Cache line 1: GPU writes, CPU reads (128 bytes) ----------- */
   uint32_t done_seq;             /**< Incremented when batch is complete    */
@@ -187,6 +191,8 @@ typedef struct
   gpu_pkt_desc_t        *descs;        /**< cudaMallocManaged: [MAX_FRAME]   */
   uint8_t               *results;      /**< cudaMallocManaged: [MAX_FRAME]   */
   gpu_classify_ctrl_t   *ctrl;         /**< cudaMallocManaged: handshake     */
+  gpu_classify_rule_t   *rules;        /**< cudaMallocManaged: [MAX_RULES]   */
+  int                    n_rules;      /**< Current active rule count        */
 
   /* Adaptive dispatch state (updated by gpu_classify_launch_kernel). */
   int      persist_active;  /**< 1 when the persistent kernel is running    */

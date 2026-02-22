@@ -15,14 +15,14 @@ via clock_gettime() inside gpu_classify_launch_kernel().  It excludes all
 VPP feature-arc and buffer-management overhead.  The difference between
 "GPU μs/fr" (wall-clock frame time) and "kern μs" is VPP overhead.
 
-Four scenarios, each run at rule counts {1, 8, 32, 64}:
+Four scenarios, each run at rule counts {1, 8, 64, 256, 1024}:
 
   no-match      N deny rules; traffic matches none     → full linear scan
   first-match   N rules;      traffic matches rule 0   → exits after 1 compare
   last-match    N rules;      traffic matches rule N-1 → full linear scan + match
-  diverse-pfx   N dst-prefix rules cycling /8→/16→/24→/32;
+  diverse-pfx   64 rules with 1→2→4→8→16 distinct (src_mask, dst_mask) combos;
                 traffic matches none.  ACL plugin builds one hash table per
-                unique prefix length (up to 4); GPU still scans linearly.
+                unique combo; GPU still scans linearly regardless.
 
 GPU  action for "matching" rules  → MARK  (packet forwarded)
 ACL  action for "matching" rules  → PERMIT (packet forwarded)
@@ -71,8 +71,8 @@ class TestGpuClassifyBench(VppTestCase):
 
     POLL_S = 0.05      # seconds between "show packet-generator" polls
 
-    # Rule counts to sweep (gpu_classify maximum is 64)
-    RULE_COUNTS = [1, 8, 32, 64]
+    # Rule counts to sweep (gpu_classify maximum is now 1024)
+    RULE_COUNTS = [1, 8, 64, 256, 1024]
 
     # Port assignments — chosen so there is no accidental overlap:
     #   DENY_PORT_BASE  ports 5000-5063  →  deny rules that never match traffic
@@ -82,43 +82,54 @@ class TestGpuClassifyBench(VppTestCase):
     MATCH_PORT_BASE = 9000
     PASS_PORT       = 1234
 
-    # Scenario 4: diverse dst prefix lengths.
+    # Scenario 4: diverse src+dst prefix mask combinations.
     #
     # N_RULES_DIVERSE rules are always installed; what varies is how many
-    # *distinct prefix lengths* (mask types) those rules span.  The ACL
-    # plugin builds one hash table per unique dst-prefix mask, so its cost
-    # grows with mask diversity.  The GPU scans all N rules linearly —
-    # its cost is independent of mask diversity.
+    # *distinct (src_mask, dst_mask) combinations* those rules span.
+    # The ACL plugin builds one hash table per unique (src_mask, dst_mask)
+    # pair, so its lookup cost grows with mask diversity.  The GPU scans
+    # all N rules linearly — its cost is independent of mask diversity.
     #
-    # MASK_COUNTS = [1, 2, 4, 8] — number of distinct prefix lengths used.
-    # All rules split evenly across the chosen lengths:
-    #   mask_count=1 →  64 rules of /8  only        →  1 ACL table
-    #   mask_count=2 →  32 rules /8  + 32 rules /16  →  2 ACL tables
-    #   mask_count=4 →  16 rules each /8,/12,/16,/20  →  4 ACL tables
-    #   mask_count=8 →   8 rules each /8,/12,…,/32  →  8 ACL tables
+    # SRC_LENGTHS = DST_LENGTHS = [8, 16, 24, 32] → 4×4 = 16 unique combos.
     #
-    # Prefix pools: 64 non-overlapping prefixes per length, all outside
-    # 172.16.x.x (the pg test subnet):
+    # MASK_COUNTS = [1, 2, 4, 8, 16]:
+    #   mask_count=1  →  64 rules all (src/8,  dst/8)   →  1 ACL table
+    #   mask_count=2  →  32 rules each (s/8,d/8) and (s/24,d/32) → 2 tables
+    #   mask_count=4  →  16 rules each across 4 combos  →  4 ACL tables
+    #   mask_count=8  →   8 rules each across 8 combos  →  8 ACL tables
+    #   mask_count=16 →   4 rules each across all 16 combos → 16 ACL tables
+    #
+    # Src prefix pool (avoids 172.16.x.x — test traffic src is pg0.remote_ip4):
+    #   /8 : 1.0.0.0/8 … 64.0.0.0/8
+    #   /16: 2.0.0.0/16 … 2.63.0.0/16
+    #   /24: 3.0.0.0/24 … 3.0.63.0/24
+    #   /32: 4.0.0.1/32 … 4.0.0.64/32
+    #
+    # Dst prefix pool (avoids 172.16.x.x — test traffic dst is pg1.remote_ip4):
     #   /8 : 20.0.0.0/8 … 83.0.0.0/8   (first octets 20–83)
-    #   /12: 40.0.0.0/12, 40.16.0.0/12, …  (cycling octets 40–43)
     #   /16: 100.0.0.0/16 … 100.63.0.0/16
-    #   /20: 101.0.0.0/20, 101.0.16.0/20, … (101.0–3 × 16 subnets)
     #   /24: 102.0.0.0/24 … 102.0.63.0/24
-    #   /28: 103.0.0.0/28, 103.0.0.16/28, … (103.0.0–3 × 16 subnets)
-    #   /30: 104.0.0.0/30 … 104.0.0.252/30  (steps of 4)
     #   /32: 105.0.0.1/32 … 105.0.0.64/32
     N_RULES_DIVERSE = 64
-    MASK_COUNTS     = [1, 2, 4, 8]
-    LENGTHS_ALL     = [8, 12, 16, 20, 24, 28, 30, 32]   # 8 possible lengths
-    _PFX = {
-        8:  [f"{20+i}.0.0.0/8"                for i in range(64)],
-        12: [f"{40+i//16}.{(i%16)*16}.0.0/12" for i in range(64)],
-        16: [f"100.{i}.0.0/16"                for i in range(64)],
-        20: [f"101.{i//16}.{(i%16)*16}.0/20"  for i in range(64)],
-        24: [f"102.0.{i}.0/24"                for i in range(64)],
-        28: [f"103.0.{i//16}.{(i%16)*16}/28"  for i in range(64)],
-        30: [f"104.0.{i//64}.{(i%64)*4}/30"   for i in range(64)],
-        32: [f"105.0.0.{i+1}/32"              for i in range(64)],
+    MASK_COUNTS     = [1, 2, 4, 8, 16]
+    SRC_LENGTHS     = [8, 16, 24, 32]
+    DST_LENGTHS     = [8, 16, 24, 32]
+    # All 16 (src_plen, dst_plen) combinations, row-major over SRC×DST.
+    # (Must inline literals — Python 3 list comprehensions cannot see class-
+    #  level names from the enclosing class body scope.)
+    ALL_MASK_COMBOS = [(sl, dl) for sl in [8, 16, 24, 32]
+                       for dl in [8, 16, 24, 32]]
+    _SRC_PFX = {
+        8:  [f"{1+i}.0.0.0/8"    for i in range(64)],   # 1/8 … 64/8
+        16: [f"2.{i}.0.0/16"     for i in range(64)],   # 2.0/16 … 2.63/16
+        24: [f"3.0.{i}.0/24"     for i in range(64)],   # 3.0.0/24 … 3.0.63/24
+        32: [f"4.0.0.{i+1}/32"   for i in range(64)],   # 4.0.0.1/32 … 4.0.0.64/32
+    }
+    _DST_PFX = {
+        8:  [f"{20+i}.0.0.0/8"   for i in range(64)],   # 20/8 … 83/8
+        16: [f"100.{i}.0.0/16"   for i in range(64)],   # 100.0/16 … 100.63/16
+        24: [f"102.0.{i}.0/24"   for i in range(64)],   # 102.0.0/24 … 102.0.63/24
+        32: [f"105.0.0.{i+1}/32" for i in range(64)],   # 105.0.0.1/32 … 105.0.0.64/32
     }
 
     # ------------------------------------------------------------------
@@ -349,6 +360,12 @@ class TestGpuClassifyBench(VppTestCase):
         """Add a GPU deny rule matching *only* a dst IP prefix (any proto/port)."""
         self.vapi.cli(f"gpu-classify rule add dst {prefix} action {action}")
 
+    def _gpu_rule_src_dst_prefix(self, src_prefix, dst_prefix, action="drop"):
+        """Add a GPU rule matching both a src and dst IP prefix."""
+        self.vapi.cli(
+            f"gpu-classify rule add src {src_prefix} dst {dst_prefix} action {action}"
+        )
+
     def _gpu_snapshot(self):
         """Parse 'show gpu-classify' and return kernel timing stats.
 
@@ -434,6 +451,14 @@ class TestGpuClassifyBench(VppTestCase):
     def _acl_deny_prefix(self, prefix):
         """Return a stateless deny rule matching a dst IP prefix (any proto/port)."""
         return AclRule(is_permit=0, dst_prefix=IPv4Network(prefix))
+
+    def _acl_deny_src_dst_prefix(self, src_prefix, dst_prefix):
+        """Return a stateless deny rule matching both src and dst IP prefixes."""
+        return AclRule(
+            is_permit=0,
+            src_prefix=IPv4Network(src_prefix),
+            dst_prefix=IPv4Network(dst_prefix),
+        )
 
     # ------------------------------------------------------------------
     # Results table helpers
@@ -641,68 +666,75 @@ class TestGpuClassifyBench(VppTestCase):
     # ==================================================================
 
     def test_bench_04_diverse_prefix(self):
-        """Benchmark: 64 rules, sweep distinct dst prefix lengths 1→2→4→8.
+        """Benchmark: 64 rules, sweep distinct src+dst prefix mask combos 1→16.
 
         Total rules are always N_RULES_DIVERSE=64, split evenly across the
-        chosen number of distinct prefix lengths.  Traffic never matches any
-        rule (no-match / pass).
+        chosen number of distinct (src_mask, dst_mask) combinations.
+        Traffic never matches any rule (no-match / pass).
 
-        The ACL plugin builds one hash table per unique dst-prefix mask
-        (one per distinct prefix length), so lookup cost grows with mask
-        diversity while rule count stays constant.  The GPU always scans all
-        64 rules linearly; its cost is independent of mask diversity.
+        The ACL plugin builds one hash table per unique (src_mask, dst_mask)
+        pair, so lookup cost grows with mask-combo diversity while rule count
+        stays constant.  The GPU always scans all 64 rules linearly; its
+        cost is independent of mask diversity.
 
         Expected trend:
-          ACL µs/fr  grows with mask count  (more hash-table probes per pkt)
+          ACL µs/fr  grows with mask_count  (more hash-table probes per pkt)
           GPU µs/fr  stays flat             (same 64 rules regardless)
         """
         pkts = self._pkts(self.PASS_PORT)
 
         n_total_k = self.BATCH * self.N_REPS // 1000
-        w = 88
+        w = 104
         print(f"\n{'=' * w}")
         print(
-            f"  Scenario 4 — diverse dst prefix lengths  "
+            f"  Scenario 4 — diverse src+dst prefix mask combinations  "
             f"({self.N_RULES_DIVERSE} rules total, no-match traffic;\n"
             f"  {self.BATCH}-pkt frames, "
             f"{self.N_REPS} reps = {n_total_k}k pkts per measurement)"
         )
-        print('=' * w)
+        print("=" * w)
         print(
-            f"  ACL builds 1 hash table per distinct dst-prefix length;\n"
-            f"  its per-packet cost grows linearly with mask count.\n"
+            f"  ACL builds 1 hash table per unique (src_mask, dst_mask) pair;\n"
+            f"  its per-packet cost grows with combo count.\n"
             f"  GPU always scans {self.N_RULES_DIVERSE} rules; cost is independent of mask diversity."
         )
         print(
-            f"\n  {'Masks':>6}  "
+            f"\n  {'Combos':>6}  "
             f"{'GPU Mpps':>10}  {'GPU μs/fr':>10}  {'kern μs':>8}  "
             f"{'ACL Mpps':>10}  {'ACL μs/fr':>10}  "
             f"{'GPU/ACL':>8}  "
-            f"{'Lengths used'}"
+            f"{'(src, dst) lengths used'}"
         )
         print(
             f"  {'-'*6}  {'-'*10}  {'-'*10}  {'-'*8}  "
             f"{'-'*10}  {'-'*10}  {'-'*8}  "
-            f"{'-'*20}"
+            f"{'-'*30}"
         )
 
         for mask_count in self.MASK_COUNTS:
             gpu_mpps = gpu_us = kern_us = acl_mpps = acl_us = None
 
-            # Choose the first mask_count lengths; split 64 rules evenly.
-            lengths   = self.LENGTHS_ALL[:mask_count]
-            n_per_len = self.N_RULES_DIVERSE // mask_count
-            prefixes  = []
-            for j, plen in enumerate(lengths):
-                prefixes += self._PFX[plen][:n_per_len]
+            # Use the first mask_count (src_plen, dst_plen) combos;
+            # split N_RULES_DIVERSE rules evenly across them.
+            combos    = self.ALL_MASK_COMBOS[:mask_count]
+            n_per_cbo = self.N_RULES_DIVERSE // mask_count
+            rule_pairs = []   # list of (src_pfx, dst_pfx) strings
+            for j, (splen, dplen) in enumerate(combos):
+                for k in range(n_per_cbo):
+                    rule_pairs.append(
+                        (self._SRC_PFX[splen][j * n_per_cbo + k],
+                         self._DST_PFX[dplen][j * n_per_cbo + k])
+                    )
 
-            lengths_str = "+".join(f"/{l}" for l in lengths)
+            combos_str = " ".join(f"(/{sl},/{dl})" for sl, dl in combos[:4])
+            if len(combos) > 4:
+                combos_str += f" …+{len(combos)-4}more"
 
             # ---- GPU ----
             if self.gpu_available:
                 self._gpu_enable()
-                for pfx in prefixes:
-                    self._gpu_rule_prefix(pfx, "drop")
+                for src_pfx, dst_pfx in rule_pairs:
+                    self._gpu_rule_src_dst_prefix(src_pfx, dst_pfx, "drop")
                 snap0 = self._gpu_snapshot()
                 gpu_mpps, gpu_us = self._time_pg(pkts)
                 snap1 = self._gpu_snapshot()
@@ -711,15 +743,14 @@ class TestGpuClassifyBench(VppTestCase):
 
             # ---- ACL ----
             if self.acl_available:
-                rules = (
-                    [self._acl_deny_prefix(pfx) for pfx in prefixes]
+                acl_rules = (
+                    [self._acl_deny_src_dst_prefix(sp, dp) for sp, dp in rule_pairs]
                     + [AclRule(is_permit=1)]   # permit-all fallthrough
                 )
-                self._acl_install(rules)
+                self._acl_install(acl_rules)
                 acl_mpps, acl_us = self._time_pg(pkts)
                 self._acl_remove()
 
-            # Print row with an extra column showing which lengths were used.
             def fmt_mpps(v):
                 return f"{v:10.3f}" if v is not None else f"{'n/a':>10}"
             def fmt_us(v):
@@ -737,13 +768,15 @@ class TestGpuClassifyBench(VppTestCase):
                 f"{fmt_mpps(gpu_mpps)}  {fmt_us(gpu_us)}  {fmt_kern(kern_us)}  "
                 f"{fmt_mpps(acl_mpps)}  {fmt_us(acl_us)}  "
                 f"{ratio:>8}  "
-                f"{lengths_str}"
+                f"{combos_str}"
             )
 
         self._print_kern_note()
         print(
-            f"  Note: 'Masks' = number of distinct dst prefix lengths in the rule set.\n"
-            f"  All rows have exactly {self.N_RULES_DIVERSE} rules; only mask diversity varies."
+            f"  Note: 'Combos' = number of distinct (src_mask, dst_mask) pairs.\n"
+            f"  All rows have exactly {self.N_RULES_DIVERSE} rules; only mask diversity varies.\n"
+            f"  Src prefixes: 1-64/8, 2.0-63/16, 3.0.0-63/24, 4.0.0.1-64/32\n"
+            f"  Dst prefixes: 20-83/8, 100.0-63/16, 102.0.0-63/24, 105.0.0.1-64/32"
         )
 
 

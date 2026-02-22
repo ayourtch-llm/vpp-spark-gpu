@@ -10,10 +10,15 @@
  *    cudaMallocManaged() buffers are accessible from both sides with
  *    ~no migration cost; cudaMemAdvise() is used as a placement hint only.
  *
- *  Constant memory (64 KB, broadcast):
- *    All 32 threads in a warp read the same rule in the same cycle via
- *    a single broadcast — no bank conflicts, effectively "free" reads.
- *    64 rules × 80 bytes = 5 120 bytes consumed.
+ *  Managed-memory rule table (cudaMallocManaged, const __restrict__):
+ *    Rules are stored in NVLink-C2C managed memory, passed to the kernel
+ *    as a const __restrict__ pointer.  The compiler emits ld.global.nc
+ *    (L1 read-only cache) loads; all threads in a warp accessing the same
+ *    rule index receive a single broadcast read.  The Blackwell L2 cache
+ *    (128 MB) easily fits the full rule table (1024 × 80 B = 80 KB).
+ *    This approach removes the 64 KB constant-memory limit and eliminates
+ *    the cudaMemcpyToSymbol null-stream deadlock that affected the old
+ *    __constant__ design.
  *
  *  One thread per packet:
  *    Block = 256 threads (== VLIB_FRAME_SIZE).  Grid = 1 block per call.
@@ -44,11 +49,14 @@
 /* ================================================================== */
 /* Device-side data                                                    */
 /* ================================================================== */
-
-/** Rules in constant memory.  Written once (or rarely) from the host
- *  via cudaMemcpyToSymbol; read every invocation by every thread.    */
-__constant__ gpu_classify_rule_t d_rules[GPU_CLASSIFY_MAX_RULES];
-__constant__ int		 d_n_rules;
+/*
+ * Rules and rule count are no longer stored in __constant__ memory.
+ * They live in cudaMallocManaged memory, passed to each kernel as a
+ * const __restrict__ pointer (ld.global.nc = L1 read-only cache path)
+ * and an int.  This removes the 64 KB constant-memory limit (allows
+ * up to GPU_CLASSIFY_MAX_RULES = 1024 rules) and eliminates the
+ * cudaMemcpyToSymbol null-stream deadlock.
+ */
 
 /* ================================================================== */
 /* Device-side helpers                                                 */
@@ -87,12 +95,16 @@ ip_matches (const uint8_t *pkt, const uint8_t *addr, const uint8_t *mask)
  * Extracted as a shared device inline so both the on-demand kernel
  * and the persistent kernel can call it without code duplication.
  *
- * @param d  Pointer to the packet descriptor to classify.
- * @return   GPU_CLASSIFY_ACTION_* value for the first matching rule,
- *           or GPU_CLASSIFY_ACTION_PASS if no rule matches.
+ * @param d       Pointer to the packet descriptor to classify.
+ * @param rules   Rule table (cudaMallocManaged, const __restrict__).
+ * @param n_rules Number of active rules in the table.
+ * @return        GPU_CLASSIFY_ACTION_* value for the first matching rule,
+ *                or GPU_CLASSIFY_ACTION_PASS if no rule matches.
  */
 __device__ __forceinline__ static uint8_t
-gpu_classify_match_packet (const gpu_pkt_desc_t *d)
+gpu_classify_match_packet (const gpu_pkt_desc_t *d,
+			   const gpu_classify_rule_t *__restrict__ rules,
+			   int n_rules)
 {
   uint8_t action = GPU_CLASSIFY_ACTION_PASS; /* default: no match */
 
@@ -100,15 +112,16 @@ gpu_classify_match_packet (const gpu_pkt_desc_t *d)
    * Walk rules sequentially; first match wins.
    *
    * All threads in a warp visit the same rule index in lockstep.
-   * d_rules is in constant memory → broadcast read (single transaction
-   * for the entire warp, zero latency after L1 cache warm-up).
+   * rules is marked const __restrict__: the compiler emits ld.global.nc
+   * (L1 read-only cache) loads, which broadcast to all threads in a warp
+   * for the same index — zero bank-conflict penalty.
    *
    * Divergence due to 'continue' only affects per-thread predicate
    * evaluation, not the memory access pattern — all warps keep pace.
    */
-  for (int i = 0; i < d_n_rules; i++)
+  for (int i = 0; i < n_rules; i++)
     {
-      const gpu_classify_rule_t *r = &d_rules[i];
+      const gpu_classify_rule_t *r = &rules[i];
 
       /* ---- Protocol ------------------------------------------------ */
       if (r->proto != 0 && r->proto != d->ip_proto)
@@ -160,10 +173,13 @@ gpu_classify_match_packet (const gpu_pkt_desc_t *d)
  *                  byte per packet (and GPU_CLASSIFY_ACTION_PASS for
  *                  unused slots beyond n_packets).
  * @param n_packets Number of live packets in this invocation (≤ MAX_FRAME).
+ * @param rules     Rule table (cudaMallocManaged, const __restrict__).
+ * @param n_rules   Number of active rules.
  */
 __global__ void
 gpu_classify_kernel (const gpu_pkt_desc_t *__restrict__ descs,
-		     uint8_t *__restrict__ results, int n_packets)
+		     uint8_t *__restrict__ results, int n_packets,
+		     const gpu_classify_rule_t *__restrict__ rules, int n_rules)
 {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -176,7 +192,7 @@ gpu_classify_kernel (const gpu_pkt_desc_t *__restrict__ descs,
       return;
     }
 
-  results[tid] = gpu_classify_match_packet (&descs[tid]);
+  results[tid] = gpu_classify_match_packet (&descs[tid], rules, n_rules);
 }
 
 /**
@@ -194,10 +210,14 @@ gpu_classify_kernel (const gpu_pkt_desc_t *__restrict__ descs,
  * @param ctrl     CPU↔GPU handshake control block (managed memory).
  * @param descs    Packet descriptor array (managed memory, CPU-written).
  * @param results  Result array (managed memory, GPU-written).
+ * @param rules    Rule table (cudaMallocManaged, const __restrict__).
+ *                 Rule count is read per batch from ctrl->n_rules so
+ *                 the CPU can update rules without stopping the kernel.
  */
 __global__ void
 gpu_classify_persistent (gpu_classify_ctrl_t *ctrl,
-			 const gpu_pkt_desc_t *descs, uint8_t *results)
+			 const gpu_pkt_desc_t *descs, uint8_t *results,
+			 const gpu_classify_rule_t *__restrict__ rules)
 {
   int tid = threadIdx.x; /* blockIdx.x == 0 always (single-block launch) */
 
@@ -255,9 +275,10 @@ gpu_classify_persistent (gpu_classify_ctrl_t *ctrl,
 	return;
 
       /* ---- Phase 3: classify ---------------------------------------- */
-      int n = (int) ctrl->n_packets;
+      int n        = (int) ctrl->n_packets;
+      int n_rules  = (int) ctrl->n_rules;
       if (tid < n)
-	results[tid] = gpu_classify_match_packet (&descs[tid]);
+	results[tid] = gpu_classify_match_packet (&descs[tid], rules, n_rules);
       else if (tid < GPU_CLASSIFY_MAX_FRAME)
 	results[tid] = GPU_CLASSIFY_ACTION_PASS;
 
@@ -351,13 +372,15 @@ gpu_classify_start_persistent (gpu_classify_cuda_res_t *res)
   __atomic_store_n (&ctrl->done_seq,   0u, __ATOMIC_RELAXED);
   ctrl->kill	  = 0;
   ctrl->n_packets = 0;
+  ctrl->n_rules   = (int32_t) res->n_rules;
 
   /* Full fence: all resets must be globally visible before the GPU
    * kernel executes its first polling iteration.                     */
   __atomic_thread_fence (__ATOMIC_SEQ_CST);
 
   gpu_classify_persistent<<<dim3 (1), dim3 (GPU_CLASSIFY_MAX_FRAME), 0,
-			     stream>>> (ctrl, res->descs, res->results);
+			     stream>>> (ctrl, res->descs, res->results,
+				       res->rules);
 
   cudaError_t err = cudaGetLastError ();
   if (err == cudaSuccess)
@@ -459,12 +482,35 @@ extern "C"
       }
     memset (res->ctrl, 0, sizeof (gpu_classify_ctrl_t));
 
+    /* Allocate the rule table in managed memory.
+     *
+     * Rules are written by the CPU (CLI/API handlers) and read by the
+     * GPU kernel.  On NVLink-C2C the preferred CPU-side location means
+     * the CPU writes are cheap (same physical DRAM) and the GPU fetches
+     * via the read-only L1 cache path (ld.global.nc).                */
+    err = cudaMallocManaged (reinterpret_cast<void **> (&res->rules),
+			     GPU_CLASSIFY_MAX_RULES *
+			       sizeof (gpu_classify_rule_t));
+    if (err != cudaSuccess)
+      {
+	fprintf (stderr, "gpu_classify: cudaMallocManaged (rules): %s\n",
+		 cudaGetErrorString (err));
+	goto fail_ctrl;
+      }
+    memset (res->rules, 0,
+	    GPU_CLASSIFY_MAX_RULES * sizeof (gpu_classify_rule_t));
+    res->n_rules = 0;
+
     /* Hint preferred locations:
      *   descs   → CPU writes, GPU reads  → prefer CPU-side DRAM.
+     *   rules   → CPU writes, GPU reads  → prefer CPU-side DRAM.
      *   results → GPU writes, CPU reads  → prefer GPU-side DRAM.
      *   ctrl    → mixed read/write       → no preference hint.       */
     cudaMemAdvise (res->descs,
 		   GPU_CLASSIFY_MAX_FRAME * sizeof (gpu_pkt_desc_t),
+		   cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
+    cudaMemAdvise (res->rules,
+		   GPU_CLASSIFY_MAX_RULES * sizeof (gpu_classify_rule_t),
 		   cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
     cudaMemAdvise (res->results, GPU_CLASSIFY_MAX_FRAME * sizeof (uint8_t),
 		   cudaMemAdviseSetPreferredLocation, 0 /* device 0 */);
@@ -479,15 +525,11 @@ extern "C"
     res->busy_frames     = 0;
     res->idle_frames     = 0;
 
-    /* Seed constant memory with zero rules. */
-    {
-      int zero = 0;
-      cudaMemcpyToSymbol (d_n_rules, &zero, sizeof (int), 0,
-			  cudaMemcpyHostToDevice);
-    }
-
     return 0;
 
+  fail_ctrl:
+    cudaFree (res->ctrl);
+    res->ctrl = nullptr;
   fail_results:
     cudaFree (res->results);
     res->results = nullptr;
@@ -508,6 +550,11 @@ extern "C"
     if (res->persist_active)
       gpu_classify_stop_persistent (res);
 
+    if (res->rules)
+      {
+	cudaFree (res->rules);
+	res->rules = nullptr;
+      }
     if (res->ctrl)
       {
 	cudaFree (res->ctrl);
@@ -539,48 +586,30 @@ extern "C"
       return -1;
 
     /*
-     * cudaMemcpyToSymbol runs on the null (default) CUDA stream, which
-     * implicitly synchronises with all blocking streams before executing.
-     * If the persistent kernel is running on our named blocking stream,
-     * the null-stream memcpy would wait forever for it to finish.
+     * Rules live in cudaMallocManaged memory (res->rules), so updating
+     * them is a plain CPU memcpy — no CUDA API calls, no null-stream
+     * interference, no need to stop/restart the persistent kernel.
      *
-     * Additionally, the GPU's L1 constant-memory cache is only invalidated
-     * on kernel launch, so a running persistent kernel would NOT see any
-     * constant-memory update until it is stopped and restarted.
+     * On NVLink-C2C (Grace ↔ Blackwell) managed memory is physically
+     * shared DRAM with full cache coherency, so the GPU sees the new
+     * rules immediately via the hardware coherence protocol.
      *
-     * Fix: stop the persistent kernel before the memcpy and restart it
-     * immediately after.  Rule updates are management-plane operations
-     * (CLI-driven, rare), so the ~100 µs stop/restart overhead is fine.
+     * The persistent kernel reads ctrl->n_rules once per batch
+     * (volatile, after the acquire load of submit_seq).  We store
+     * n_rules first, then update ctrl->n_rules with a release fence,
+     * so the kernel is guaranteed to see the new table on its next batch.
      */
-    int was_persistent = (res && res->persist_active);
-    if (was_persistent)
-      gpu_classify_stop_persistent (res);
-
-    cudaError_t err;
-
     if (n_rules > 0)
-      {
-	err =
-	  cudaMemcpyToSymbol (d_rules, rules,
-			      n_rules * sizeof (gpu_classify_rule_t), 0,
-			      cudaMemcpyHostToDevice);
-	if (err != cudaSuccess)
-	  {
-	    if (was_persistent)
-	      gpu_classify_start_persistent (res);
-	    return -1;
-	  }
-      }
+      memcpy (res->rules, rules, n_rules * sizeof (gpu_classify_rule_t));
 
-    int n = static_cast<int> (n_rules);
-    err =
-      cudaMemcpyToSymbol (d_n_rules, &n, sizeof (int), 0,
-			  cudaMemcpyHostToDevice);
+    res->n_rules = (int) n_rules;
 
-    if (was_persistent)
-      gpu_classify_start_persistent (res);
+    /* If the persistent kernel is live, propagate the new count. */
+    if (res->persist_active)
+      __atomic_store_n (&res->ctrl->n_rules, (int32_t) n_rules,
+			__ATOMIC_RELEASE);
 
-    return (err == cudaSuccess) ? 0 : -1;
+    return 0;
   }
 
   /* ---------------------------------------------------------------- */
@@ -664,7 +693,8 @@ extern "C"
 	dim3	     grid (1);
 
 	gpu_classify_kernel<<<grid, block, 0, stream>>> (
-	  res->descs, res->results, static_cast<int> (n_packets));
+	  res->descs, res->results, static_cast<int> (n_packets),
+	  res->rules, res->n_rules);
 
 	cudaError_t err = cudaStreamSynchronize (stream);
 	if (err != cudaSuccess)
