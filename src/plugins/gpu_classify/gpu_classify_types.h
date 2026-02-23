@@ -152,7 +152,10 @@ typedef struct
   volatile int32_t  n_packets;   /**< Packet count for this batch           */
   volatile int32_t  n_rules;     /**< Active rule count (updated by CPU)    */
   volatile uint32_t kill;        /**< Set to 1 to terminate the kernel      */
-  uint8_t _cpu_pad[128 - 16];    /**< Pad to exactly 128 bytes              */
+  volatile uint32_t rule_version;/**< Incremented by CPU whenever the rule
+				  *   table changes; GPU reloads shmem when
+				  *   its cached copy differs.               */
+  uint8_t _cpu_pad[128 - 20];    /**< Pad to exactly 128 bytes              */
 
   /* ---- Cache line 1: GPU writes, CPU reads (128 bytes) ----------- */
   uint32_t done_seq;             /**< Incremented when batch is complete    */

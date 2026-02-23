@@ -20,30 +20,32 @@
  *    the cudaMemcpyToSymbol null-stream deadlock that affected the old
  *    __constant__ design.
  *
- *  Tiled shared-memory rule caching (key optimisation):
+ *  Shared-memory rule caching — split design:
+ *
  *    Although the L1 read-only cache normally hides global-memory latency
  *    via warp switching, the 8 warps in this kernel are perfectly
  *    synchronised — they all access the same rule index at the same
  *    cycle.  When all warps stall together the SM has no other warp to
  *    schedule, so L1 latency (~28-40 cycles per cache line) is exposed.
  *
- *    The fix: rules are classified in tiles of GPU_CLASSIFY_TILE_RULES
- *    (= 256) at a time.  All 256 threads cooperatively load one tile
- *    from global memory into on-chip shared memory (SRAM, ~4-8 cycle
- *    latency), then each classifies against the tile.  Before each tile
- *    load, all threads vote via a shared-memory atomic: if every thread
- *    has already found a match the block exits early without loading
- *    remaining tiles.  This gives:
+ *    On-demand kernel — tiled shmem (gpu_classify_tiled):
+ *      Rules are loaded 256 at a time from global → shared memory.
+ *      A per-tile block-wide vote skips loading remaining tiles once
+ *      all threads have matched.  Shmem = 256 × 80 B + 4 B = 20 484 B;
+ *      fits within the 48 KB default limit, no cudaFuncSetAttribute.
+ *      This path is used only during the first few frames before the
+ *      persistent kernel activates.
  *
- *      - No-match / full-scan: ~27% speedup vs global-memory access;
- *        every rule read is a fast shmem load instead of an L1 stall.
- *
- *      - First-match at rule 0: only one tile loaded; vote breaks on
- *        the second tile → kern µs stays ~4 µs regardless of rule count.
- *
- *    Shmem per block = 256 × 80 B (rule tile) + 4 B (vote flag)
- *                    = 20 484 bytes — well within the 48 KB default.
- *    No cudaFuncSetAttribute call is needed.
+ *    Persistent kernel — full-table persistent cache (gpu_classify_from_shmem):
+ *      The persistent kernel keeps its block resident for the entire VPP
+ *      session.  Its shmem (GPU_CLASSIFY_PERSIST_SHMEM_BYTES = 80 KB) is
+ *      allocated once at kernel launch and survives across frames.
+ *      On startup (and whenever ctrl->rule_version changes), all 256
+ *      threads cooperatively load the full rule table into shmem; every
+ *      subsequent frame classifies directly from already-hot shmem with
+ *      no global-memory traffic for rules at all.
+ *      cudaFuncSetAttribute is called once at init to unlock > 48 KB
+ *      for the persistent kernel only.
  *
  *  One thread per packet:
  *    Block = 256 threads (== VLIB_FRAME_SIZE).  Grid = 1 block per call.
@@ -88,7 +90,7 @@
  *  complement in a single round of cooperative loads.                */
 #define GPU_CLASSIFY_TILE_RULES  GPU_CLASSIFY_MAX_FRAME
 
-/** Dynamic shared memory allocated per kernel block.
+/** Dynamic shared memory for the on-demand kernel (gpu_classify_kernel).
  *
  *  Layout:
  *    [0 .. TILE_RULES × 80)  gpu_classify_rule_t s_rules[TILE_RULES]
@@ -99,6 +101,18 @@
 static const size_t GPU_CLASSIFY_SHMEM_BYTES =
   (size_t) GPU_CLASSIFY_TILE_RULES * sizeof (gpu_classify_rule_t) +
   sizeof (int);
+
+/** Dynamic shared memory for the persistent kernel (gpu_classify_persistent).
+ *
+ *  The persistent kernel caches the full rule table across frames:
+ *    [0 .. MAX_RULES × 80)  gpu_classify_rule_t s_rules[MAX_RULES]
+ *
+ *  1024 × 80 B = 81 920 bytes — exceeds the 48 KB default limit.
+ *  cudaFuncSetAttribute(cudaFuncAttributeMaxDynamicSharedMemorySize)
+ *  must be called at init time to opt in (Blackwell supports ≤ 256 KB
+ *  per block with the opt-in).                                        */
+static const size_t GPU_CLASSIFY_PERSIST_SHMEM_BYTES =
+  (size_t) GPU_CLASSIFY_MAX_RULES * sizeof (gpu_classify_rule_t);
 
 /* ================================================================== */
 /* Device-side helpers                                                 */
@@ -278,6 +292,65 @@ gpu_classify_tiled (int tid, int n_packets, int n_rules,
     results[tid] = my_action;
 }
 
+/**
+ * @brief Classify one VPP frame against rules already resident in shmem.
+ *
+ * Used by the persistent kernel after the full rule table has been
+ * loaded into shared memory.  No tile loads, no block-wide votes —
+ * each thread independently scans s_rules[0..n_rules) and breaks on
+ * the first match.
+ *
+ * No __syncthreads() is needed here: shmem was loaded and synchronised
+ * in the caller's Phase 0 (rule reload), and each thread writes only
+ * its own results[tid] slot.
+ *
+ * @param tid     Linear thread index.
+ * @param n       Number of live packets in this batch.
+ * @param n_rules Number of active rules in s_rules[].
+ * @param descs   Packet descriptor array (managed memory).
+ * @param s_rules Rule table already in shared memory.
+ * @param results Result byte array (one byte per slot).
+ */
+__device__ static void
+gpu_classify_from_shmem (int tid, int n, int n_rules,
+			 const gpu_pkt_desc_t *descs,
+			 const gpu_classify_rule_t *s_rules,
+			 uint8_t *results)
+{
+  uint8_t action = GPU_CLASSIFY_ACTION_PASS;
+
+  if (tid < n)
+    {
+      const gpu_pkt_desc_t *d = &descs[tid];
+
+      for (int i = 0; i < n_rules; i++)
+	{
+	  const gpu_classify_rule_t *r = &s_rules[i];
+
+	  if (r->proto != 0 && r->proto != d->ip_proto)
+	    continue;
+	  if (r->ip_version != 0 && r->ip_version != d->ip_version)
+	    continue;
+	  if (!ip_matches (d->src_ip, r->src_addr, r->src_mask))
+	    continue;
+	  if (!ip_matches (d->dst_ip, r->dst_addr, r->dst_mask))
+	    continue;
+	  if (r->src_port != 0 && r->src_port != d->src_port)
+	    continue;
+	  if (r->dst_port != 0 && r->dst_port != d->dst_port)
+	    continue;
+	  if (r->tcp_flags_mask != 0 &&
+	      (d->tcp_flags & r->tcp_flags_mask) != r->tcp_flags_val)
+	    continue;
+
+	  action = r->action;
+	  break;
+	}
+    }
+
+  results[tid] = action;
+}
+
 /* ================================================================== */
 /* Kernels                                                             */
 /* ================================================================== */
@@ -334,6 +407,21 @@ gpu_classify_persistent (gpu_classify_ctrl_t *ctrl,
   int tid = threadIdx.x; /* blockIdx.x == 0 always (single-block launch) */
 
   /*
+   * Full rule table cached in shared memory across all frames.
+   *
+   * GPU_CLASSIFY_PERSIST_SHMEM_BYTES = MAX_RULES × 80 B = 81 920 bytes,
+   * allocated once at kernel launch.  Rules are loaded into shmem in
+   * Phase 0 when rule_version changes; every subsequent frame classifies
+   * directly from already-hot shmem — zero global-memory rule traffic.
+   *
+   * last_rule_version = ~0u forces the initial load on the very first
+   * batch regardless of the value ctrl->rule_version carries at start.
+   */
+  extern __shared__ uint8_t shmem[];
+  const gpu_classify_rule_t *s_rules =
+    (const gpu_classify_rule_t *) shmem;
+
+  /*
    * System-scope atomic reference type for the handshake fields.
    *
    * cuda::thread_scope_system guarantees visibility across GPU and CPU
@@ -342,8 +430,8 @@ gpu_classify_persistent (gpu_classify_ctrl_t *ctrl,
    * the GPU (ld.volatile is a weakly-ordered load per PTX ISA).
    *
    * memory_order_acquire on submit_seq load: once we see a new seq,
-   * all CPU writes before the CPU's release-store (n_packets, kill) are
-   * guaranteed visible to this GPU thread.
+   * all CPU writes before the CPU's release-store (n_packets, kill,
+   * n_rules, rule_version) are guaranteed visible to this GPU thread.
    *
    * memory_order_release on done_seq store: pairs with the CPU's
    * acquire-load.  The CPU is guaranteed to see all results[] writes
@@ -351,7 +439,8 @@ gpu_classify_persistent (gpu_classify_ctrl_t *ctrl,
    */
   using sys_u32 = cuda::atomic_ref<uint32_t, cuda::thread_scope_system>;
 
-  uint32_t last_seq = 0; /* tracks the last seq each thread processed  */
+  uint32_t last_seq          = 0;    /* last batch seq processed          */
+  uint32_t last_rule_version = ~0u;  /* ~0 forces load on first batch     */
 
   for (;;)
     {
@@ -369,8 +458,8 @@ gpu_classify_persistent (gpu_classify_ctrl_t *ctrl,
        * can save energy while waiting.  Available on sm_70+.
        *
        * Acquire load: pairs with the CPU's SEQ_CST store of submit_seq,
-       * guaranteeing that n_packets / kill written before the CPU's
-       * release are visible to ALL GPU threads once they see the new seq.
+       * guaranteeing that n_packets / kill / n_rules / rule_version
+       * written before the CPU's store are all visible to GPU threads.
        */
       uint32_t seq;
       do
@@ -386,25 +475,45 @@ gpu_classify_persistent (gpu_classify_ctrl_t *ctrl,
       if (ctrl->kill)
 	return;
 
-      /* ---- Phase 3: classify (tiled, with per-tile early exit) ------- *
-       * Snapshot n_packets / n_rules from ctrl after the acquire load    *
-       * of submit_seq (which ensures both are visible).  The tiled       *
-       * helper uses the block's shared memory; shmem is allocated at     *
-       * launch time to GPU_CLASSIFY_SHMEM_BYTES and shared across all    *
-       * iterations of the outer polling loop.                            */
-      int n       = (int) ctrl->n_packets;
-      int n_rules = (int) ctrl->n_rules;
-      gpu_classify_tiled (tid, n, n_rules, descs, rules, results);
+      /* Snapshot batch parameters (all visible after acquire of seq).   */
+      int	 n       = (int) ctrl->n_packets;
+      int	 n_rules = (int) ctrl->n_rules;
+      uint32_t rv      = (uint32_t) ctrl->rule_version;
+
+      /* ---- Phase 0: conditional rule reload into shmem --------------- *
+       * The CPU increments ctrl->rule_version (RELEASE) whenever it     *
+       * updates the rule table.  When this thread sees a new version,   *
+       * all 256 threads cooperatively copy the full rule table from     *
+       * managed memory into shared memory, then __syncthreads() ensures *
+       * every thread sees the new rules before classification begins.   *
+       *                                                                  *
+       * The condition evaluates identically for all threads (all share   *
+       * the same last_rule_version and read the same volatile field),   *
+       * so the __syncthreads() inside is always reached uniformly.      *
+       *                                                                  *
+       * On frames where rules have not changed, shmem is already valid  *
+       * and the load is skipped entirely — zero global-memory rule I/O. */
+      if (rv != last_rule_version)
+	{
+	  last_rule_version = rv;
+	  int	       total = n_rules * (int) (sizeof (gpu_classify_rule_t) /
+					      sizeof (uint32_t));
+	  const uint32_t *src = (const uint32_t *) rules;
+	  uint32_t	 *dst = (uint32_t *) shmem;
+	  for (int w = tid; w < total; w += blockDim.x)
+	    dst[w] = src[w];
+	  __syncthreads (); /* all threads see loaded rules before classifying */
+	}
+
+      /* ---- Phase 3: classify from shmem — no global rule traffic ----- */
+      gpu_classify_from_shmem (tid, n, n_rules, descs, s_rules, results);
 
       /* ---- Phase 4: signal completion -------------------------------- *
-       * __threadfence_system(): called by ALL threads to flush their     *
-       * result writes out of the GPU L2 to be visible system-wide (CPU). *
-       *                                                                  *
-       * __syncthreads(): ensures every thread has finished writing and   *
-       * flushing its result before thread 0 signals done_seq.           *
-       *                                                                  *
-       * done_seq release-store (thread 0 only): pairs with the CPU's    *
-       * acquire-load.  The CPU sees all results[] once done_seq updates. */
+       * __threadfence_system(): flush result writes from GPU L2 to be   *
+       * visible system-wide (CPU).                                      *
+       * __syncthreads(): wait for all threads to flush before thread 0  *
+       * signals done_seq.                                               *
+       * done_seq release-store pairs with the CPU's acquire-load.       */
       __threadfence_system ();
       __syncthreads ();
 
@@ -488,11 +597,12 @@ gpu_classify_start_persistent (gpu_classify_cuda_res_t *res)
    * kernel executes its first polling iteration.                     */
   __atomic_thread_fence (__ATOMIC_SEQ_CST);
 
-  /* GPU_CLASSIFY_SHMEM_BYTES = tile size + vote flag = 20 484 bytes.
-   * Sized at the maximum tile size so the window is large enough for
-   * any supported rule count; fits within the default 48 KB limit.  */
+  /* GPU_CLASSIFY_PERSIST_SHMEM_BYTES = full rule table = 80 KB.
+   * cudaFuncSetAttribute has already opted this kernel in at init time.
+   * The shmem window persists for the kernel's lifetime and is reused
+   * across all frames; rules are reloaded only when rule_version changes. */
   gpu_classify_persistent<<<dim3 (1), dim3 (GPU_CLASSIFY_MAX_FRAME),
-			     GPU_CLASSIFY_SHMEM_BYTES,
+			     GPU_CLASSIFY_PERSIST_SHMEM_BYTES,
 			     stream>>> (ctrl, res->descs, res->results,
 					res->rules);
 
@@ -615,6 +725,27 @@ extern "C"
 	    GPU_CLASSIFY_MAX_RULES * sizeof (gpu_classify_rule_t));
     res->n_rules = 0;
 
+    /* Unlock > 48 KB of dynamic shared memory for the persistent kernel.
+     *
+     * GPU_CLASSIFY_PERSIST_SHMEM_BYTES = 80 KB (full rule table).
+     * Blackwell supports up to 256 KB per block with this opt-in.
+     * The on-demand kernel uses only 20 KB (tiled) and needs no opt-in.
+     *
+     * Failure means the persistent kernel cannot cache the full rule
+     * table; treat as fatal since it would fall back to an oversized
+     * shmem request at launch time.                                      */
+    err = cudaFuncSetAttribute (
+      (const void *) gpu_classify_persistent,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      (int) GPU_CLASSIFY_PERSIST_SHMEM_BYTES);
+    if (err != cudaSuccess)
+      {
+	fprintf (stderr,
+		 "gpu_classify: cudaFuncSetAttribute (persistent): %s\n",
+		 cudaGetErrorString (err));
+	goto fail_rules;
+      }
+
     /* Hint preferred locations:
      *   descs   → CPU writes, GPU reads  → prefer CPU-side DRAM.
      *   rules   → CPU writes, GPU reads  → prefer CPU-side DRAM.
@@ -641,6 +772,9 @@ extern "C"
 
     return 0;
 
+  fail_rules:
+    cudaFree (res->rules);
+    res->rules = nullptr;
   fail_ctrl:
     cudaFree (res->ctrl);
     res->ctrl = nullptr;
@@ -718,10 +852,18 @@ extern "C"
 
     res->n_rules = (int) n_rules;
 
-    /* If the persistent kernel is live, propagate the new count. */
+    /* If the persistent kernel is live, propagate the new count and bump
+     * rule_version so the kernel reloads its shmem cache on the next batch.
+     *
+     * Ordering: n_rules must be visible before rule_version so the kernel
+     * always classifies with a consistent (count, data) pair.  Both stores
+     * use RELEASE so the preceding memcpy is also ordered before them.    */
     if (res->persist_active)
-      __atomic_store_n (&res->ctrl->n_rules, (int32_t) n_rules,
-			__ATOMIC_RELEASE);
+      {
+	__atomic_store_n (&res->ctrl->n_rules, (int32_t) n_rules,
+			  __ATOMIC_RELEASE);
+	__atomic_fetch_add (&res->ctrl->rule_version, 1u, __ATOMIC_RELEASE);
+      }
 
     return 0;
   }
