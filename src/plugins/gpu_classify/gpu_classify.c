@@ -470,6 +470,23 @@ gpu_classify_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
 		   (unsigned long long) gcm->n_drop,
 		   (unsigned long long) gcm->n_mark);
 
+  /* Hash-table summary line (after CUDA init only). */
+  if (gcm->cuda_ready)
+    {
+      if (res->n_hash_tables > 0)
+	{
+	  u32 total_hash_slots = 0;
+	  for (int t = 0; t < res->n_hash_tables; t++)
+	    total_hash_slots += res->hash_descs[t].n_slots;
+	  vlib_cli_output (vm, "  Hash    : %d tables, %u total slots",
+			   res->n_hash_tables, total_hash_slots);
+	}
+      else
+	{
+	  vlib_cli_output (vm, "  Hash    : 0 tables (linear scan fallback)");
+	}
+    }
+
   /* ---- GPU device properties ---- */
   if (gcm->cuda_ready)
     {

@@ -24,6 +24,12 @@
  *  the Blackwell L2 (128 MB).  Raise freely as needed.               */
 #define GPU_CLASSIFY_MAX_RULES  1024
 
+/** Maximum number of distinct mask-combo hash tables.
+ *  If the rule set has more than this many distinct (src_mask, dst_mask,
+ *  port/proto/version/flags) combinations, the plugin falls back to the
+ *  linear scan path.  64 covers all practical ACL rule sets.         */
+#define GPU_CLASSIFY_MAX_TABLES  64
+
 /** Maximum packets per VPP frame (== VLIB_FRAME_SIZE).               */
 #define GPU_CLASSIFY_MAX_FRAME  256
 
@@ -114,6 +120,72 @@ typedef struct
 } gpu_classify_rule_t;
 
 /* ------------------------------------------------------------------ */
+/* Hash-table entry — 48 bytes                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * @brief One slot in a GPU hash table.
+ *
+ * Key fields (src_ip … tcp_flags_val) store the masked, normalised key
+ * derived from the matching rule.  The probe side masks the packet with
+ * the enclosing table descriptor's mask fields and compares.
+ *
+ * ip_version == 0 means the enclosing table matches both IPv4 and IPv6;
+ * all packets produce mver = 0 when match_ip_version == 0, so they
+ * will match entries whose ip_version == 0.
+ *
+ * valid == 0 is the empty-slot sentinel; the linear probe terminates on
+ * the first invalid entry (open addressing, 50 % load factor).
+ */
+typedef struct
+{
+  uint8_t  src_ip[16];      /**< Masked source IP key (4-byte aligned)       */
+  uint8_t  dst_ip[16];      /**< Masked dest IP key                          */
+  uint16_t src_port;        /**< 0 = wildcard (match_src_port == 0)          */
+  uint16_t dst_port;        /**< 0 = wildcard (match_dst_port == 0)          */
+  uint8_t  proto;           /**< 0 = wildcard (match_proto == 0)             */
+  uint8_t  ip_version;      /**< 0 = any IP version                          */
+  uint8_t  tcp_flags_val;   /**< pkt.tcp_flags & desc.tcp_flags_mask         */
+  uint8_t  action;          /**< GPU_CLASSIFY_ACTION_*                       */
+  uint8_t  valid;           /**< 1 = occupied, 0 = empty sentinel            */
+  uint8_t  _pad[3];
+  int32_t  rule_idx;        /**< Original rule index (lower = higher prio)   */
+  /*                             ─────────────────────────────────────── 48 B */
+} gpu_hash_entry_t;
+
+/* ------------------------------------------------------------------ */
+/* Hash-table descriptor — 64 bytes (one cache line)                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * @brief Descriptor for one mask-combo hash table.
+ *
+ * All rules in this table share the same (src_mask, dst_mask,
+ * match_src_port, match_dst_port, match_proto, match_ip_version,
+ * tcp_flags_mask) combination.  Entries are stored in the flat
+ * hash_entries[] array starting at entry_base.
+ *
+ * Tables are sorted by min_rule_idx ascending so the GPU kernel can
+ * break early once best_idx ≤ td->min_rule_idx (first-match semantics).
+ */
+typedef struct
+{
+  uint8_t  src_mask[16];        /**< Source-IP mask applied to packet         */
+  uint8_t  dst_mask[16];        /**< Dest-IP mask applied to packet           */
+  uint8_t  match_src_port;      /**< 1 = include src_port in hash key         */
+  uint8_t  match_dst_port;      /**< 1 = include dst_port in hash key         */
+  uint8_t  match_proto;         /**< 1 = include ip_proto in hash key         */
+  uint8_t  match_ip_version;    /**< 1 = include ip_version in hash key       */
+  uint8_t  tcp_flags_mask;      /**< Mask applied to pkt.tcp_flags for key    */
+  uint8_t  _pad1[3];
+  uint32_t n_slots;             /**< Power-of-2 slot count (≥ 2× rules)      */
+  uint32_t entry_base;          /**< Index of first slot in hash_entries[]    */
+  int32_t  min_rule_idx;        /**< Lowest rule_idx in this table            */
+  uint8_t  _pad2[12];
+  /*                             ─────────────────────────────────────── 64 B */
+} gpu_hash_table_desc_t;
+
+/* ------------------------------------------------------------------ */
 /* Persistent-kernel control block — 256 bytes, two cache lines      */
 /* ------------------------------------------------------------------ */
 
@@ -148,14 +220,14 @@ typedef struct
    * submit_seq / done_seq: accessed via cuda::atomic_ref on the GPU  *
    * and __atomic_store/load_n on the CPU.  They MUST be plain (non-  *
    * volatile) uint32_t so cuda::atomic_ref can bind without a cast.  */
-  uint32_t submit_seq;           /**< Incremented per batch by the CPU      */
-  volatile int32_t  n_packets;   /**< Packet count for this batch           */
-  volatile int32_t  n_rules;     /**< Active rule count (updated by CPU)    */
-  volatile uint32_t kill;        /**< Set to 1 to terminate the kernel      */
-  volatile uint32_t rule_version;/**< Incremented by CPU whenever the rule
-				  *   table changes; GPU reloads shmem when
-				  *   its cached copy differs.               */
-  uint8_t _cpu_pad[128 - 20];    /**< Pad to exactly 128 bytes              */
+  uint32_t submit_seq;             /**< Incremented per batch by the CPU    */
+  volatile int32_t  n_packets;     /**< Packet count for this batch         */
+  volatile int32_t  n_rules;       /**< Active rule count (updated by CPU)  */
+  volatile uint32_t kill;          /**< Set to 1 to terminate the kernel    */
+  volatile uint32_t rule_version;  /**< Incremented by CPU whenever the rule
+				    *   table changes; GPU reloads shmem.  */
+  volatile int32_t  n_hash_tables; /**< > 0 → hash path; 0 → linear scan   */
+  uint8_t _cpu_pad[128 - 24];      /**< Pad to exactly 128 bytes            */
 
   /* ---- Cache line 1: GPU writes, CPU reads (128 bytes) ----------- */
   uint32_t done_seq;             /**< Incremented when batch is complete    */
@@ -196,6 +268,15 @@ typedef struct
   gpu_classify_ctrl_t   *ctrl;         /**< cudaMallocManaged: handshake     */
   gpu_classify_rule_t   *rules;        /**< cudaMallocManaged: [MAX_RULES]   */
   int                    n_rules;      /**< Current active rule count        */
+
+  /** Hash-table buffers (cudaMallocManaged).
+   *  hash_entries: flat open-addressing slot array (4096 × 48 B = 192 KB).
+   *  hash_descs:   per-table descriptors (MAX_TABLES × 64 B = 4 KB).
+   *  n_hash_tables > 0 → hash path; 0 → linear scan fallback.         */
+  gpu_hash_entry_t      *hash_entries;         /**< Flat hash-entry array    */
+  gpu_hash_table_desc_t *hash_descs;           /**< Table descriptors        */
+  int                    n_hash_tables;        /**< Active table count        */
+  uint32_t               hash_entry_capacity; /**< Slots in hash_entries[]   */
 
   /* Adaptive dispatch state (updated by gpu_classify_launch_kernel). */
   int      persist_active;  /**< 1 when the persistent kernel is running    */

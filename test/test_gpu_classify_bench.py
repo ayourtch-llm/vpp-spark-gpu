@@ -21,8 +21,8 @@ Four scenarios, each run at rule counts {1, 8, 64, 256, 1024}:
   first-match   N rules;      traffic matches rule 0   → exits after 1 compare
   last-match    N rules;      traffic matches rule N-1 → full linear scan + match
   diverse-pfx   1024 dst-only rules, 1→2→4→8→16→21 distinct dst prefix lengths
-                (each distinct prefix length = one ACL hash table).  Traffic
-                matches none.  ACL probes K tables; GPU scans linearly.
+                (each distinct prefix length = one mask combo = one hash table).
+                Traffic matches none.  Both ACL and GPU now probe K tables.
 
 GPU  action for "matching" rules  → MARK  (packet forwarded)
 ACL  action for "matching" rules  → PERMIT (packet forwarded)
@@ -755,18 +755,24 @@ class TestGpuClassifyBench(VppTestCase):
         chosen number of distinct dst prefix lengths.  Traffic never matches
         any rule (no-match / pass-through).
 
-        The ACL plugin builds one hash table per unique dst_mask value, so K
-        distinct prefix lengths → K ACL hash-table probes per packet.  The
-        GPU always scans all 1024 rules linearly; its cost is independent of
-        prefix-length diversity.
+        Both the ACL plugin and the GPU hash path build one hash table per
+        unique dst_mask value:
+          ACL: K distinct prefix lengths → K hash-table probes per packet
+          GPU: K distinct dst_masks      → K GPU hash tables → K probes/pkt
+
+        So both scale O(K) with prefix-length diversity.  The GPU advantage is
+        that each probe is ~1-2 µs (GPU kern time), while ACL probes dominate
+        µs/frame at high K.  VPP feature-arc overhead (~30 µs) dominates both
+        at low K.
 
         Rule addresses: _dst_diverse_prefix() places the rule index in the
         top plen bits, producing addresses in 0.0.0.0–63.255.255.255 — safely
         away from the test traffic dst (172.16.x.x).
 
-        Expected trend:
-          ACL µs/fr  grows with Tables (more hash-table probes per packet)
-          GPU µs/fr  stays flat        (same 1024 rules regardless)
+        Expected trend (with GPU hash tables):
+          Both ACL and GPU kern µs grow proportionally with K.
+          GPU total µs/fr ≈ 30 µs overhead + K × ~1 µs kern
+          ACL total µs/fr ≈ 30 µs overhead + K × ~1 µs per probe
         """
         pkts = self._pkts(self.PASS_PORT)
 
@@ -783,7 +789,7 @@ class TestGpuClassifyBench(VppTestCase):
         print("=" * w)
         print(
             f"  ACL: K distinct dst prefix lengths → K hash-table probes per packet\n"
-            f"  GPU: always scans all {self.N_RULES_DIVERSE} rules linearly (cost independent of K)"
+            f"  GPU: K distinct dst_masks          → K GPU hash tables → K probes per packet"
         )
         print(
             f"\n  {'Tables':>6}  "

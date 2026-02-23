@@ -146,6 +146,72 @@ ip_matches (const uint8_t *pkt, const uint8_t *addr, const uint8_t *mask)
 }
 
 /**
+ * @brief FNV-1a hash over the 39-byte normalised packet key.
+ *
+ * The key covers: masked src IP (16 B) + masked dst IP (16 B) +
+ * src_port (2 B) + dst_port (2 B) + proto (1 B) + ip_version (1 B) +
+ * tcp_flags_val (1 B) = 39 bytes.
+ *
+ * Usable on both host (build_hash_tables) and device (gpu_classify_hash)
+ * because all fields are plain arithmetic — no memory-space dependencies.
+ *
+ * @param msrc      16-byte masked source IP (4-byte aligned).
+ * @param mdst      16-byte masked dest IP   (4-byte aligned).
+ * @param msp       Masked/zero src_port.
+ * @param mdp       Masked/zero dst_port.
+ * @param mproto    Masked/zero ip_proto.
+ * @param mver      Masked/zero ip_version.
+ * @param mfl       pkt.tcp_flags & tcp_flags_mask.
+ * @return          32-bit FNV-1a hash value.
+ */
+__device__ __host__ static uint32_t
+gpu_fnv1a_hash (const uint8_t *msrc, const uint8_t *mdst,
+		uint16_t msp, uint16_t mdp,
+		uint8_t mproto, uint8_t mver, uint8_t mfl)
+{
+  uint32_t h = 0x811c9dc5u;
+  for (int i = 0; i < 16; i++) { h ^= msrc[i]; h *= 0x01000193u; }
+  for (int i = 0; i < 16; i++) { h ^= mdst[i]; h *= 0x01000193u; }
+  h ^= (uint8_t) (msp >> 8);   h *= 0x01000193u;
+  h ^= (uint8_t) (msp & 0xff); h *= 0x01000193u;
+  h ^= (uint8_t) (mdp >> 8);   h *= 0x01000193u;
+  h ^= (uint8_t) (mdp & 0xff); h *= 0x01000193u;
+  h ^= mproto;                  h *= 0x01000193u;
+  h ^= mver;                    h *= 0x01000193u;
+  h ^= mfl;                     h *= 0x01000193u;
+  return h;
+}
+
+/**
+ * @brief Test whether a hash entry's key matches a normalised probe key.
+ *
+ * Performs four 32-bit XOR-reduced comparisons for each 16-byte IP array,
+ * then five scalar comparisons for the remaining fields.
+ *
+ * @return  1 on full key match, 0 otherwise.
+ */
+__device__ __host__ static int
+gpu_hash_keys_eq (const gpu_hash_entry_t *e,
+		  const uint8_t *msrc, const uint8_t *mdst,
+		  uint16_t msp, uint16_t mdp,
+		  uint8_t mproto, uint8_t mver, uint8_t mfl)
+{
+  const uint32_t *es = (const uint32_t *) e->src_ip;
+  const uint32_t *ss = (const uint32_t *) msrc;
+  const uint32_t *ed = (const uint32_t *) e->dst_ip;
+  const uint32_t *sd = (const uint32_t *) mdst;
+  if ((es[0] ^ ss[0]) | (es[1] ^ ss[1]) | (es[2] ^ ss[2]) | (es[3] ^ ss[3]))
+    return 0;
+  if ((ed[0] ^ sd[0]) | (ed[1] ^ sd[1]) | (ed[2] ^ sd[2]) | (ed[3] ^ sd[3]))
+    return 0;
+  return ((e->src_port     == msp)    &
+	  (e->dst_port     == mdp)    &
+	  (e->proto        == mproto) &
+	  (e->ip_version   == mver)   &
+	  (e->tcp_flags_val == mfl));
+}
+
+/**
  * @brief Tiled shared-memory classification of one VPP frame.
  *
  * All 256 threads cooperatively load GPU_CLASSIFY_TILE_RULES rules at a
@@ -351,6 +417,103 @@ gpu_classify_from_shmem (int tid, int n, int n_rules,
   results[tid] = action;
 }
 
+/**
+ * @brief O(K) hash-table classification of one VPP frame.
+ *
+ * Iterates over K sorted table descriptors (lowest min_rule_idx first).
+ * For each table, the thread computes a masked probe key, hashes it with
+ * FNV-1a, and performs linear probing in the flat hash_entries[] array.
+ *
+ * First-match semantics are preserved via best_idx: once a match is found
+ * at rule_idx R, any table whose min_rule_idx >= R cannot produce a
+ * higher-priority match and the loop terminates early.
+ *
+ * No __syncthreads() is needed: shmem descriptors were loaded and
+ * synchronised in the caller (persistent kernel Phase 0), and each
+ * thread writes only its own results[tid] slot.
+ *
+ * @param tid           Linear thread index.
+ * @param n_pkts        Number of live packets in this batch.
+ * @param n_tables      Number of hash tables (K).
+ * @param descs         Packet descriptor array (managed memory).
+ * @param tdescs        Table descriptor array (shmem or global memory).
+ * @param entries       Flat hash-entry array (managed memory, __restrict__).
+ * @param results       Result byte array (one byte per slot).
+ */
+__device__ static void
+gpu_classify_hash (int tid, int n_pkts, int n_tables,
+		   const gpu_pkt_desc_t *descs,
+		   const gpu_hash_table_desc_t *tdescs,
+		   const gpu_hash_entry_t *__restrict__ entries,
+		   uint8_t *results)
+{
+  uint8_t best_action = GPU_CLASSIFY_ACTION_PASS;
+  int32_t best_idx    = 0x7fffffff;
+
+  if (tid < n_pkts)
+    {
+      const gpu_pkt_desc_t *d = &descs[tid];
+
+      for (int t = 0; t < n_tables; t++)
+	{
+	  const gpu_hash_table_desc_t *td = &tdescs[t];
+
+	  /* Early exit: remaining tables have equal or higher min_rule_idx. */
+	  if (td->min_rule_idx >= best_idx)
+	    break;
+
+	  /* Apply address masks (4 × 32-bit words = 16 bytes each). */
+	  const uint32_t *src = (const uint32_t *) d->src_ip;
+	  const uint32_t *sm  = (const uint32_t *) td->src_mask;
+	  const uint32_t *dst = (const uint32_t *) d->dst_ip;
+	  const uint32_t *dm  = (const uint32_t *) td->dst_mask;
+	  uint32_t msr[4], mdr[4];
+	  msr[0] = src[0] & sm[0]; msr[1] = src[1] & sm[1];
+	  msr[2] = src[2] & sm[2]; msr[3] = src[3] & sm[3];
+	  mdr[0] = dst[0] & dm[0]; mdr[1] = dst[1] & dm[1];
+	  mdr[2] = dst[2] & dm[2]; mdr[3] = dst[3] & dm[3];
+
+	  /* Compute normalised scalar key fields. */
+	  uint16_t msp    = td->match_src_port    ? d->src_port   : 0;
+	  uint16_t mdp    = td->match_dst_port    ? d->dst_port   : 0;
+	  uint8_t  mproto = td->match_proto       ? d->ip_proto   : 0;
+	  uint8_t  mver   = td->match_ip_version  ? d->ip_version : 0;
+	  uint8_t  mfl    = d->tcp_flags & td->tcp_flags_mask;
+
+	  /* Hash the full 39-byte key and compute the initial slot. */
+	  uint32_t h    = gpu_fnv1a_hash ((const uint8_t *) msr,
+					  (const uint8_t *) mdr,
+					  msp, mdp, mproto, mver, mfl);
+	  uint32_t slot = h & (td->n_slots - 1);
+	  uint32_t base = td->entry_base;
+
+	  /* Linear probe until empty sentinel or key match. */
+	  for (uint32_t probe = 0; probe < td->n_slots; probe++)
+	    {
+	      const gpu_hash_entry_t *e = &entries[base + slot];
+	      if (!e->valid)
+		break; /* empty slot → no match in this table */
+	      if (gpu_hash_keys_eq (e, (const uint8_t *) msr,
+				    (const uint8_t *) mdr,
+				    msp, mdp, mproto, mver, mfl))
+		{
+		  if (e->rule_idx < best_idx)
+		    {
+		      best_idx    = e->rule_idx;
+		      best_action = e->action;
+		    }
+		  break; /* key is unique per table */
+		}
+	      slot = (slot + 1) & (td->n_slots - 1);
+	    }
+	}
+    }
+
+  /* Write result; padding threads write PASS. */
+  if (tid < GPU_CLASSIFY_MAX_FRAME)
+    results[tid] = best_action;
+}
+
 /* ================================================================== */
 /* Kernels                                                             */
 /* ================================================================== */
@@ -359,25 +522,32 @@ gpu_classify_from_shmem (int tid, int n, int n_rules,
  * @brief Classify one VPP frame of packets in parallel (on-demand).
  *
  * One block of GPU_CLASSIFY_MAX_FRAME threads; one thread per packet
- * slot.  Delegates all classification to gpu_classify_tiled(), which
- * uses the block's shared memory for tiled rule caching with early exit.
+ * slot.  Dispatches to the O(K) hash path when n_hash_tables > 0,
+ * otherwise falls back to the tiled linear-scan path.
  *
- * @param descs     Array of GPU_CLASSIFY_MAX_FRAME packet descriptors
- *                  populated by the host.
- * @param results   Output array; kernel writes one GPU_CLASSIFY_ACTION_*
- *                  byte per packet (and GPU_CLASSIFY_ACTION_PASS for
- *                  unused slots beyond n_packets).
- * @param n_packets Number of live packets in this invocation (≤ MAX_FRAME).
- * @param rules     Rule table (cudaMallocManaged, const __restrict__).
- * @param n_rules   Number of active rules.
+ * @param descs         Array of GPU_CLASSIFY_MAX_FRAME packet descriptors.
+ * @param results       Output array (one GPU_CLASSIFY_ACTION_* byte per slot).
+ * @param n_packets     Number of live packets (≤ MAX_FRAME).
+ * @param rules         Rule table (cudaMallocManaged, __restrict__).
+ * @param n_rules       Number of active rules.
+ * @param n_hash_tables Number of hash tables; 0 → linear scan fallback.
+ * @param hash_descs    Table descriptors (cudaMallocManaged, __restrict__).
+ * @param hash_entries  Flat hash-entry array (cudaMallocManaged, __restrict__).
  */
 __global__ void
 gpu_classify_kernel (const gpu_pkt_desc_t *__restrict__ descs,
 		     uint8_t *__restrict__ results, int n_packets,
-		     const gpu_classify_rule_t *__restrict__ rules, int n_rules)
+		     const gpu_classify_rule_t *__restrict__ rules, int n_rules,
+		     int n_hash_tables,
+		     const gpu_hash_table_desc_t *__restrict__ hash_descs,
+		     const gpu_hash_entry_t *__restrict__ hash_entries)
 {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  gpu_classify_tiled (tid, n_packets, n_rules, descs, rules, results);
+  if (n_hash_tables > 0)
+    gpu_classify_hash (tid, n_packets, n_hash_tables, descs,
+		       hash_descs, hash_entries, results);
+  else
+    gpu_classify_tiled (tid, n_packets, n_rules, descs, rules, results);
 }
 
 /**
@@ -392,34 +562,41 @@ gpu_classify_kernel (const gpu_pkt_desc_t *__restrict__ descs,
  * Power efficiency: __nanosleep(100) in the poll loop lets the SM
  * deschedule the warp while waiting (~100 ns sleep interval).
  *
- * @param ctrl     CPU↔GPU handshake control block (managed memory).
- * @param descs    Packet descriptor array (managed memory, CPU-written).
- * @param results  Result array (managed memory, GPU-written).
- * @param rules    Rule table (cudaMallocManaged, const __restrict__).
- *                 Rule count is read per batch from ctrl->n_rules so
- *                 the CPU can update rules without stopping the kernel.
+ * @param ctrl         CPU↔GPU handshake control block (managed memory).
+ * @param descs        Packet descriptor array (managed memory, CPU-written).
+ * @param results      Result array (managed memory, GPU-written).
+ * @param rules        Rule table (cudaMallocManaged, const __restrict__).
+ * @param hash_descs   Table descriptors (cudaMallocManaged, __restrict__).
+ * @param hash_entries Flat hash-entry array (cudaMallocManaged, __restrict__).
  */
 __global__ void
 gpu_classify_persistent (gpu_classify_ctrl_t *ctrl,
 			 const gpu_pkt_desc_t *descs, uint8_t *results,
-			 const gpu_classify_rule_t *__restrict__ rules)
+			 const gpu_classify_rule_t *__restrict__ rules,
+			 const gpu_hash_table_desc_t *__restrict__ hash_descs,
+			 const gpu_hash_entry_t *__restrict__ hash_entries)
 {
   int tid = threadIdx.x; /* blockIdx.x == 0 always (single-block launch) */
 
   /*
-   * Full rule table cached in shared memory across all frames.
+   * Shared memory is dual-use — same allocation, different content:
    *
-   * GPU_CLASSIFY_PERSIST_SHMEM_BYTES = MAX_RULES × 80 B = 81 920 bytes,
-   * allocated once at kernel launch.  Rules are loaded into shmem in
-   * Phase 0 when rule_version changes; every subsequent frame classifies
-   * directly from already-hot shmem — zero global-memory rule traffic.
+   *   Hash path (last_n_hash_tables > 0):
+   *     s_descs: gpu_hash_table_desc_t [MAX_TABLES]  (K×64 B ≤ 4 KB)
+   *
+   *   Linear path (last_n_hash_tables == 0):
+   *     s_rules: gpu_classify_rule_t   [MAX_RULES]   (up to 80 KB)
+   *
+   * GPU_CLASSIFY_PERSIST_SHMEM_BYTES = 80 KB covers both paths.
+   * cudaFuncSetAttribute has already unlocked > 48 KB at init time.
    *
    * last_rule_version = ~0u forces the initial load on the very first
-   * batch regardless of the value ctrl->rule_version carries at start.
+   * batch regardless of ctrl->rule_version at start.
+   * last_n_hash_tables = -1 is re-set in Phase 0 before Phase 3 reads it.
    */
   extern __shared__ uint8_t shmem[];
-  const gpu_classify_rule_t *s_rules =
-    (const gpu_classify_rule_t *) shmem;
+  const gpu_classify_rule_t      *s_rules  = (const gpu_classify_rule_t *)  shmem;
+  /* s_descs overlaps s_rules — valid only when last_n_hash_tables > 0 */
 
   /*
    * System-scope atomic reference type for the handshake fields.
@@ -431,7 +608,7 @@ gpu_classify_persistent (gpu_classify_ctrl_t *ctrl,
    *
    * memory_order_acquire on submit_seq load: once we see a new seq,
    * all CPU writes before the CPU's release-store (n_packets, kill,
-   * n_rules, rule_version) are guaranteed visible to this GPU thread.
+   * n_rules, rule_version, n_hash_tables) are guaranteed visible.
    *
    * memory_order_release on done_seq store: pairs with the CPU's
    * acquire-load.  The CPU is guaranteed to see all results[] writes
@@ -439,8 +616,9 @@ gpu_classify_persistent (gpu_classify_ctrl_t *ctrl,
    */
   using sys_u32 = cuda::atomic_ref<uint32_t, cuda::thread_scope_system>;
 
-  uint32_t last_seq          = 0;    /* last batch seq processed          */
-  uint32_t last_rule_version = ~0u;  /* ~0 forces load on first batch     */
+  uint32_t last_seq          = 0;    /* last batch seq processed           */
+  uint32_t last_rule_version = ~0u;  /* ~0 forces load on first batch      */
+  int32_t  last_n_hash_tables = -1;  /* -1: re-set unconditionally in Ph.0 */
 
   for (;;)
     {
@@ -476,37 +654,62 @@ gpu_classify_persistent (gpu_classify_ctrl_t *ctrl,
 	return;
 
       /* Snapshot batch parameters (all visible after acquire of seq).   */
-      int	 n       = (int) ctrl->n_packets;
-      int	 n_rules = (int) ctrl->n_rules;
+      int      n       = (int) ctrl->n_packets;
+      int      n_rules = (int) ctrl->n_rules;
+      int32_t  nh      = ctrl->n_hash_tables;
       uint32_t rv      = (uint32_t) ctrl->rule_version;
 
-      /* ---- Phase 0: conditional rule reload into shmem --------------- *
+      /* ---- Phase 0: conditional shmem reload ------------------------- *
        * The CPU increments ctrl->rule_version (RELEASE) whenever it     *
-       * updates the rule table.  When this thread sees a new version,   *
-       * all 256 threads cooperatively copy the full rule table from     *
-       * managed memory into shared memory, then __syncthreads() ensures *
-       * every thread sees the new rules before classification begins.   *
+       * updates the rule table.  All threads cooperatively reload shmem *
+       * on version change, then __syncthreads() ensures every thread    *
+       * sees the new content before classification begins.              *
        *                                                                  *
-       * The condition evaluates identically for all threads (all share   *
-       * the same last_rule_version and read the same volatile field),   *
-       * so the __syncthreads() inside is always reached uniformly.      *
+       *   Hash path  (nh > 0): load K×64 B descriptors into shmem.     *
+       *   Linear path (nh == 0): load full N×80 B rule table.          *
        *                                                                  *
        * On frames where rules have not changed, shmem is already valid  *
        * and the load is skipped entirely — zero global-memory rule I/O. */
       if (rv != last_rule_version)
 	{
-	  last_rule_version = rv;
-	  int	       total = n_rules * (int) (sizeof (gpu_classify_rule_t) /
+	  last_rule_version   = rv;
+	  last_n_hash_tables  = nh;
+	  if (nh > 0)
+	    {
+	      /* Cooperative load of K table descriptors (K×64 B). */
+	      int total_dw = nh * (int) (sizeof (gpu_hash_table_desc_t) /
+					 sizeof (uint32_t));
+	      const uint32_t *srcd = (const uint32_t *) hash_descs;
+	      uint32_t       *dstd = (uint32_t *) shmem;
+	      for (int w = tid; w < total_dw; w += blockDim.x)
+		dstd[w] = srcd[w];
+	    }
+	  else
+	    {
+	      /* Cooperative load of full rule table (N×80 B). */
+	      int	       total = n_rules *
+				       (int) (sizeof (gpu_classify_rule_t) /
 					      sizeof (uint32_t));
-	  const uint32_t *src = (const uint32_t *) rules;
-	  uint32_t	 *dst = (uint32_t *) shmem;
-	  for (int w = tid; w < total; w += blockDim.x)
-	    dst[w] = src[w];
-	  __syncthreads (); /* all threads see loaded rules before classifying */
+	      const uint32_t *src = (const uint32_t *) rules;
+	      uint32_t	     *dst = (uint32_t *) shmem;
+	      for (int w = tid; w < total; w += blockDim.x)
+		dst[w] = src[w];
+	    }
+	  __syncthreads (); /* shmem fully loaded before any thread classifies */
 	}
 
       /* ---- Phase 3: classify from shmem — no global rule traffic ----- */
-      gpu_classify_from_shmem (tid, n, n_rules, descs, s_rules, results);
+      if (last_n_hash_tables > 0)
+	{
+	  const gpu_hash_table_desc_t *s_descs =
+	    (const gpu_hash_table_desc_t *) shmem;
+	  gpu_classify_hash (tid, n, (int) last_n_hash_tables,
+			     descs, s_descs, hash_entries, results);
+	}
+      else
+	{
+	  gpu_classify_from_shmem (tid, n, n_rules, descs, s_rules, results);
+	}
 
       /* ---- Phase 4: signal completion -------------------------------- *
        * __threadfence_system(): flush result writes from GPU L2 to be   *
@@ -525,6 +728,203 @@ gpu_classify_persistent (gpu_classify_ctrl_t *ctrl,
 /* ================================================================== */
 /* Host-side helpers                                                   */
 /* ================================================================== */
+
+/**
+ * @brief Build GPU hash tables from the current rule set.
+ *
+ * This function runs entirely on the CPU.  It partitions rules into groups
+ * sharing the same (src_mask, dst_mask, port/proto/version/flags) combo,
+ * builds an open-addressing hash table per group at 50 % load factor,
+ * sorts the resulting descriptors by min_rule_idx (ascending), and copies
+ * everything to the cudaMallocManaged buffers in @a res.
+ *
+ * If the number of distinct mask combos exceeds GPU_CLASSIFY_MAX_TABLES,
+ * sets res->n_hash_tables = 0 to trigger the linear-scan fallback.
+ *
+ * Caller must hold the rules_lock.
+ */
+static void
+gpu_classify_build_hash_tables (gpu_classify_cuda_res_t *res,
+				const gpu_classify_rule_t *rules,
+				int n_rules)
+{
+  if (n_rules == 0)
+    {
+      res->n_hash_tables = 0;
+      return;
+    }
+
+  /* ---- Local working arrays (stack; MAX_TABLES = 64, MAX_RULES = 1024) */
+  gpu_hash_table_desc_t descs[GPU_CLASSIFY_MAX_TABLES];
+  int rule_table[GPU_CLASSIFY_MAX_RULES]; /* maps rule i → table index */
+  int n_tables = 0;
+
+  /* ---- Pass 1: find distinct mask combos ----------------------------- */
+  for (int i = 0; i < n_rules; i++)
+    {
+      const gpu_classify_rule_t *r = &rules[i];
+
+      uint8_t match_src_port   = (r->src_port != 0);
+      uint8_t match_dst_port   = (r->dst_port != 0);
+      uint8_t match_proto      = (r->proto != 0);
+      uint8_t match_ip_version = (r->ip_version != 0);
+      uint8_t tcp_flags_mask   = r->tcp_flags_mask;
+
+      /* Search for an existing table with the same combo. */
+      int t;
+      for (t = 0; t < n_tables; t++)
+	{
+	  gpu_hash_table_desc_t *td = &descs[t];
+	  if (memcmp (td->src_mask, r->src_mask, 16) == 0 &&
+	      memcmp (td->dst_mask, r->dst_mask, 16) == 0 &&
+	      td->match_src_port   == match_src_port   &&
+	      td->match_dst_port   == match_dst_port   &&
+	      td->match_proto      == match_proto       &&
+	      td->match_ip_version == match_ip_version  &&
+	      td->tcp_flags_mask   == tcp_flags_mask)
+	    break;
+	}
+
+      if (t == n_tables)
+	{
+	  /* New combo — check capacity first. */
+	  if (n_tables >= GPU_CLASSIFY_MAX_TABLES)
+	    {
+	      res->n_hash_tables = 0; /* too many distinct mask combos */
+	      return;
+	    }
+	  memset (&descs[t], 0, sizeof (descs[t]));
+	  memcpy (descs[t].src_mask, r->src_mask, 16);
+	  memcpy (descs[t].dst_mask, r->dst_mask, 16);
+	  descs[t].match_src_port   = match_src_port;
+	  descs[t].match_dst_port   = match_dst_port;
+	  descs[t].match_proto      = match_proto;
+	  descs[t].match_ip_version = match_ip_version;
+	  descs[t].tcp_flags_mask   = tcp_flags_mask;
+	  descs[t].n_slots          = 0; /* reused as rule count in Pass 1 */
+	  descs[t].min_rule_idx     = i;
+	  n_tables++;
+	}
+      else
+	{
+	  if (i < descs[t].min_rule_idx)
+	    descs[t].min_rule_idx = i;
+	}
+
+      rule_table[i] = t;
+      descs[t].n_slots++; /* count rules per table */
+    }
+
+  /* ---- Pass 2: compute n_slots (next power-of-2 ≥ 2×count) and
+   *              entry_base (prefix-sum of slot counts).             */
+  uint32_t total_slots = 0;
+  for (int t = 0; t < n_tables; t++)
+    {
+      uint32_t cnt = descs[t].n_slots;
+      uint32_t min_s = cnt * 2;
+      if (min_s < 2)
+	min_s = 2;
+      uint32_t s = 1;
+      while (s < min_s)
+	s <<= 1;
+      descs[t].n_slots    = s;
+      descs[t].entry_base = total_slots;
+      total_slots += s;
+    }
+
+  /* Guard: should never fire with MAX_RULES=1024 / capacity=4096. */
+  if (total_slots > res->hash_entry_capacity)
+    {
+      res->n_hash_tables = 0;
+      return;
+    }
+
+  /* ---- Pass 3: zero the entry region -------------------------------- */
+  memset (res->hash_entries, 0, total_slots * sizeof (gpu_hash_entry_t));
+
+  /* ---- Pass 4: insert rules into hash tables ------------------------ */
+  for (int i = 0; i < n_rules; i++)
+    {
+      const gpu_classify_rule_t *r    = &rules[i];
+      int			 t    = rule_table[i];
+      const gpu_hash_table_desc_t *td = &descs[t];
+
+      /* Compute the normalised masked key for this rule. */
+      const uint32_t *sa = (const uint32_t *) r->src_addr;
+      const uint32_t *sm = (const uint32_t *) td->src_mask;
+      const uint32_t *da = (const uint32_t *) r->dst_addr;
+      const uint32_t *dm = (const uint32_t *) td->dst_mask;
+      uint32_t msr[4], mdr[4];
+      msr[0] = sa[0] & sm[0]; msr[1] = sa[1] & sm[1];
+      msr[2] = sa[2] & sm[2]; msr[3] = sa[3] & sm[3];
+      mdr[0] = da[0] & dm[0]; mdr[1] = da[1] & dm[1];
+      mdr[2] = da[2] & dm[2]; mdr[3] = da[3] & dm[3];
+
+      uint16_t msp    = td->match_src_port    ? r->src_port    : 0;
+      uint16_t mdp    = td->match_dst_port    ? r->dst_port    : 0;
+      uint8_t  mproto = td->match_proto       ? r->proto       : 0;
+      uint8_t  mver   = td->match_ip_version  ? r->ip_version  : 0;
+      uint8_t  mfl    = td->tcp_flags_mask    ? r->tcp_flags_val : 0;
+
+      uint32_t h    = gpu_fnv1a_hash ((const uint8_t *) msr,
+				      (const uint8_t *) mdr,
+				      msp, mdp, mproto, mver, mfl);
+      uint32_t slot = h & (td->n_slots - 1);
+      uint32_t base = td->entry_base;
+
+      /* Linear probe to find empty slot or existing duplicate key. */
+      for (uint32_t probe = 0; probe < td->n_slots; probe++)
+	{
+	  gpu_hash_entry_t *e = &res->hash_entries[base + slot];
+	  if (!e->valid)
+	    {
+	      /* Empty slot: insert new entry. */
+	      memcpy (e->src_ip, msr, 16);
+	      memcpy (e->dst_ip, mdr, 16);
+	      e->src_port      = msp;
+	      e->dst_port      = mdp;
+	      e->proto         = mproto;
+	      e->ip_version    = mver;
+	      e->tcp_flags_val = mfl;
+	      e->action        = r->action;
+	      e->valid         = 1;
+	      e->rule_idx      = i;
+	      break;
+	    }
+	  if (gpu_hash_keys_eq (e, (const uint8_t *) msr,
+				(const uint8_t *) mdr,
+				msp, mdp, mproto, mver, mfl))
+	    {
+	      /* Duplicate masked key: keep lower rule_idx (higher priority). */
+	      if (i < e->rule_idx)
+		{
+		  e->rule_idx = i;
+		  e->action   = r->action;
+		}
+	      break;
+	    }
+	  slot = (slot + 1) & (td->n_slots - 1);
+	}
+    }
+
+  /* ---- Pass 5: insertion-sort descs[] by min_rule_idx ascending ----- *
+   * ≤ 64 elements; insertion sort is O(K²) = negligible.             */
+  for (int i = 1; i < n_tables; i++)
+    {
+      gpu_hash_table_desc_t tmp = descs[i];
+      int j = i - 1;
+      while (j >= 0 && descs[j].min_rule_idx > tmp.min_rule_idx)
+	{
+	  descs[j + 1] = descs[j];
+	  j--;
+	}
+      descs[j + 1] = tmp;
+    }
+
+  /* ---- Copy sorted descriptors to managed memory -------------------- */
+  memcpy (res->hash_descs, descs, (size_t) n_tables * sizeof (descs[0]));
+  res->n_hash_tables = n_tables;
+}
 
 /**
  * Map a round-trip duration in microseconds to a log2-us histogram bucket.
@@ -589,22 +989,23 @@ gpu_classify_start_persistent (gpu_classify_cuda_res_t *res)
    * Use atomic stores for the non-volatile submit_seq / done_seq.   */
   __atomic_store_n (&ctrl->submit_seq, 0u, __ATOMIC_RELAXED);
   __atomic_store_n (&ctrl->done_seq,   0u, __ATOMIC_RELAXED);
-  ctrl->kill	  = 0;
-  ctrl->n_packets = 0;
-  ctrl->n_rules   = (int32_t) res->n_rules;
+  ctrl->kill	      = 0;
+  ctrl->n_packets     = 0;
+  ctrl->n_rules       = (int32_t) res->n_rules;
+  ctrl->n_hash_tables = (int32_t) res->n_hash_tables;
 
   /* Full fence: all resets must be globally visible before the GPU
    * kernel executes its first polling iteration.                     */
   __atomic_thread_fence (__ATOMIC_SEQ_CST);
 
-  /* GPU_CLASSIFY_PERSIST_SHMEM_BYTES = full rule table = 80 KB.
+  /* GPU_CLASSIFY_PERSIST_SHMEM_BYTES = 80 KB (full rule table).
    * cudaFuncSetAttribute has already opted this kernel in at init time.
-   * The shmem window persists for the kernel's lifetime and is reused
-   * across all frames; rules are reloaded only when rule_version changes. */
+   * Shmem is reused across frames; reloaded only when rule_version changes. */
   gpu_classify_persistent<<<dim3 (1), dim3 (GPU_CLASSIFY_MAX_FRAME),
 			     GPU_CLASSIFY_PERSIST_SHMEM_BYTES,
 			     stream>>> (ctrl, res->descs, res->results,
-					res->rules);
+					res->rules,
+					res->hash_descs, res->hash_entries);
 
   cudaError_t err = cudaGetLastError ();
   if (err == cudaSuccess)
@@ -746,16 +1147,52 @@ extern "C"
 	goto fail_rules;
       }
 
+    /* Allocate hash-table entry array (flat, 4096 × 48 B = 192 KB).
+     * CPU writes at rule-update time; GPU reads per-frame via L1 cache. */
+    err = cudaMallocManaged (reinterpret_cast<void **> (&res->hash_entries),
+			     4096u * sizeof (gpu_hash_entry_t));
+    if (err != cudaSuccess)
+      {
+	fprintf (stderr,
+		 "gpu_classify: cudaMallocManaged (hash_entries): %s\n",
+		 cudaGetErrorString (err));
+	goto fail_rules; /* rules already allocated; free it in chain */
+      }
+    memset (res->hash_entries, 0, 4096u * sizeof (gpu_hash_entry_t));
+    res->hash_entry_capacity = 4096u;
+
+    /* Allocate hash-table descriptor array (MAX_TABLES × 64 B = 4 KB). */
+    err = cudaMallocManaged (reinterpret_cast<void **> (&res->hash_descs),
+			     GPU_CLASSIFY_MAX_TABLES * sizeof (gpu_hash_table_desc_t));
+    if (err != cudaSuccess)
+      {
+	fprintf (stderr,
+		 "gpu_classify: cudaMallocManaged (hash_descs): %s\n",
+		 cudaGetErrorString (err));
+	goto fail_hash_entries;
+      }
+    memset (res->hash_descs, 0,
+	    GPU_CLASSIFY_MAX_TABLES * sizeof (gpu_hash_table_desc_t));
+    res->n_hash_tables = 0;
+
     /* Hint preferred locations:
-     *   descs   → CPU writes, GPU reads  → prefer CPU-side DRAM.
-     *   rules   → CPU writes, GPU reads  → prefer CPU-side DRAM.
-     *   results → GPU writes, CPU reads  → prefer GPU-side DRAM.
-     *   ctrl    → mixed read/write       → no preference hint.       */
+     *   descs        → CPU writes, GPU reads  → prefer CPU-side DRAM.
+     *   rules        → CPU writes, GPU reads  → prefer CPU-side DRAM.
+     *   hash_entries → CPU writes, GPU reads  → prefer CPU-side DRAM.
+     *   hash_descs   → CPU writes, GPU reads  → prefer CPU-side DRAM.
+     *   results      → GPU writes, CPU reads  → prefer GPU-side DRAM.
+     *   ctrl         → mixed read/write       → no preference hint.   */
     cudaMemAdvise (res->descs,
 		   GPU_CLASSIFY_MAX_FRAME * sizeof (gpu_pkt_desc_t),
 		   cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
     cudaMemAdvise (res->rules,
 		   GPU_CLASSIFY_MAX_RULES * sizeof (gpu_classify_rule_t),
+		   cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
+    cudaMemAdvise (res->hash_entries,
+		   4096u * sizeof (gpu_hash_entry_t),
+		   cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
+    cudaMemAdvise (res->hash_descs,
+		   GPU_CLASSIFY_MAX_TABLES * sizeof (gpu_hash_table_desc_t),
 		   cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
     cudaMemAdvise (res->results, GPU_CLASSIFY_MAX_FRAME * sizeof (uint8_t),
 		   cudaMemAdviseSetPreferredLocation, 0 /* device 0 */);
@@ -772,6 +1209,9 @@ extern "C"
 
     return 0;
 
+  fail_hash_entries:
+    cudaFree (res->hash_entries);
+    res->hash_entries = nullptr;
   fail_rules:
     cudaFree (res->rules);
     res->rules = nullptr;
@@ -798,6 +1238,16 @@ extern "C"
     if (res->persist_active)
       gpu_classify_stop_persistent (res);
 
+    if (res->hash_descs)
+      {
+	cudaFree (res->hash_descs);
+	res->hash_descs = nullptr;
+      }
+    if (res->hash_entries)
+      {
+	cudaFree (res->hash_entries);
+	res->hash_entries = nullptr;
+      }
     if (res->rules)
       {
 	cudaFree (res->rules);
@@ -852,16 +1302,24 @@ extern "C"
 
     res->n_rules = (int) n_rules;
 
-    /* If the persistent kernel is live, propagate the new count and bump
+    /* Build hash tables from the new rule set.  Populates res->hash_entries,
+     * res->hash_descs, and res->n_hash_tables.  Falls back to n_hash_tables=0
+     * (linear scan) if there are too many distinct mask combos.           */
+    gpu_classify_build_hash_tables (res, rules, (int) n_rules);
+
+    /* If the persistent kernel is live, propagate the new counts and bump
      * rule_version so the kernel reloads its shmem cache on the next batch.
      *
-     * Ordering: n_rules must be visible before rule_version so the kernel
-     * always classifies with a consistent (count, data) pair.  Both stores
-     * use RELEASE so the preceding memcpy is also ordered before them.    */
+     * Ordering: data (rules/hash_entries/hash_descs) and counts (n_rules,
+     * n_hash_tables) must all be visible before rule_version so the kernel
+     * always classifies with a fully consistent state.  Stores use RELEASE
+     * so the preceding memcpy / build_hash_tables writes are also ordered. */
     if (res->persist_active)
       {
-	__atomic_store_n (&res->ctrl->n_rules, (int32_t) n_rules,
-			  __ATOMIC_RELEASE);
+	__atomic_store_n (&res->ctrl->n_rules,
+			  (int32_t) n_rules, __ATOMIC_RELEASE);
+	__atomic_store_n (&res->ctrl->n_hash_tables,
+			  (int32_t) res->n_hash_tables, __ATOMIC_RELEASE);
 	__atomic_fetch_add (&res->ctrl->rule_version, 1u, __ATOMIC_RELEASE);
       }
 
@@ -955,7 +1413,8 @@ extern "C"
 	gpu_classify_kernel<<<grid, block, GPU_CLASSIFY_SHMEM_BYTES,
 			      stream>>> (
 	  res->descs, res->results, static_cast<int> (n_packets),
-	  res->rules, res->n_rules);
+	  res->rules, res->n_rules,
+	  res->n_hash_tables, res->hash_descs, res->hash_entries);
 
 	cudaError_t err = cudaStreamSynchronize (stream);
 	if (err != cudaSuccess)
