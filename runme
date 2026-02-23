@@ -1,25 +1,42 @@
-apt-get update
-apt-get install -y sudo vim make git </dev/null
-UNATTENDED=yes make install-dep install-ext-deps </dev/null
-curl -fsSL https://claude.ai/install.sh | bash
+#!/bin/bash
+# Run from /store/vpp inside a fresh ubuntu:24.04 container.
+# Installs all build dependencies, CUDA toolkit, and builds VPP + gpu_classify plugin.
+set -euo pipefail
 
-# ── CUDA toolkit for NVIDIA Blackwell GB10 (DGX Spark, aarch64/SBSA) ──
-# Adds NVIDIA's network repo and installs nvcc + headers for CUDA 12.8.
-# The driver (CUDA 13.0) is already present in the container image.
+export DEBIAN_FRONTEND=noninteractive
+
+# ── 0. Bootstrap ─────────────────────────────────────────────────────────────
+# Minimal packages needed before the VPP Makefile can take over.
+apt-get update -qq
+apt-get install -y --no-install-recommends sudo vim make git wget curl
+
+# ── 1. VPP build & external dependencies ─────────────────────────────────────
+# install-dep  : apt packages listed in Makefile's DEB_DEPENDS
+# install-ext-deps : builds DPDK and other external libs from source
+UNATTENDED=yes make install-dep install-ext-deps
+
+# ── 2. CUDA toolkit 12.8 ─────────────────────────────────────────────────────
+# Target: NVIDIA GB10 Blackwell (DGX Spark, aarch64/SBSA).
+# The GPU driver (CUDA 13.0) is already present in the container image;
+# only the compiler (nvcc), headers, and libraries need to be installed.
 wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
 dpkg -i cuda-keyring_1.1-1_all.deb
 rm -f cuda-keyring_1.1-1_all.deb
-apt-get update
+apt-get update -qq
 apt-get install -y cuda-toolkit-12-8
 
-# Make nvcc available in PATH for the current session and all future shells.
-# /etc/profile.d/ is sourced by bash for every login and interactive shell,
-# which means `make` subprocesses spawned from a fresh terminal also see it.
-# (Note: cmake detects nvcc via direct filesystem glob in CMakeLists.txt and
-# does NOT require PATH to be set — this export is for interactive use only.)
+# Make nvcc visible in the current session and all future shells.
+# (cmake finds nvcc via direct filesystem glob in CMakeLists.txt and does NOT
+# require PATH to be set — these exports are for interactive / script use only.)
 export PATH=/usr/local/cuda-12.8/bin:$PATH
 export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH
 cat > /etc/profile.d/cuda-12.8.sh << 'EOF'
 export PATH=/usr/local/cuda-12.8/bin:${PATH}
 export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH}
 EOF
+
+# ── 3. Claude Code ────────────────────────────────────────────────────────────
+curl -fsSL https://claude.ai/install.sh | bash
+
+# ── 4. Build VPP + gpu_classify plugin ───────────────────────────────────────
+make build-release
